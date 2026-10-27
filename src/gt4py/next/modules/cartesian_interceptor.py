@@ -458,12 +458,32 @@ def _build_periodic_square_index_map(e2v: np.ndarray) -> tuple[IndexMap, Structu
     )
     return index_map, remap_sizes
 
+# Pole seams (halo_exchange.md §8.5, option A): at reversed halo edge slots the kernel's implicit normal (lattice E2C[0] -> E2C[1])
+# is the owner's normal reversed, so normal-vector edge data is packed with e_sign (-1 there) into the local frame.
+# Dense edge fields that are normal (or tangential) vector components; edge scalars (theta_v_e, kinetic energy, ...) are not listed.
+_GLOBAL_VECTOR_EDGE_FIELDS = frozenset({
+    "vn", "vt", "next_vn", "current_vn", "vec_e", "z_vn_avg", "z_graddiv_vn", "z_nabla2_e", "z_nabla4_e2", "tangential_wind",
+    "horizontal_gradient_of_normal_wind_divergence", "predictor_normal_wind_advective_tendency",
+    "corrector_normal_wind_advective_tendency", "normal_wind_advective_tendency", "normal_wind_tendency_due_to_slow_physics_process",
+    "normal_wind_iau_increment", "horizontal_pressure_gradient", "vn_on_half_levels", "grf_tend_vn", "mass_fl_e", "z_rho_e",
+})
+# Sparse coefficients: (sign of the centre edge: output is a normal component, sign of the target edge: multiplies a vector field).
+_GLOBAL_SPARSE_SIGNS = {
+    "geofac_grdiv": (True, True), "e_flx_avg": (True, True), "rbf_vec_coeff_e": (True, True),
+    "geofac_div": (False, True), "geofac_rot": (False, True), "rbf_vec_coeff_v": (False, True),
+    "coeff_gradekin": (True, False), "primal_normal_vert_v1": (True, False), "primal_normal_vert_v2": (True, False),
+    "primal_normal_vert_x": (True, False), "primal_normal_vert_y": (True, False),
+    "dual_normal_vert_x": (True, False), "dual_normal_vert_y": (True, False),
+}
+
+
 class GlobalPackTables:
     """Pack tables of the global 10-rhombus grid (icon4py_kb/scripts/pack_tables.py --save, halo_exchange.md §8.2).
 
     gather[x] [I, J, Kolor]: global index or -1 per slot, including halo slots (one global index may fill several slots).
     slots[x] [n_entity, 3]: the owned (I, J, Kolor) slot of every entity (pack/unpack go gather -> compute -> owned).
     sparse[conn] [I, J, Kolor, slot, mult]: flat index into icon4py's [entity, local] coefficients, in map_dict slot order.
+    e_sign [I, J, Kolor], tsign[conn] [I, J, Kolor, slot]: pole-seam sign at an edge slot / at each slot's target edge (§8.5).
     """
 
     def __init__(self, path: str):
@@ -473,6 +493,10 @@ class GlobalPackTables:
             self.sparse = {
                 k[len("sparse_"):]: d[k].astype(np.int64) for k in d.files if k.startswith("sparse_")
             }
+            self.e_sign = d["e_sign"] if "e_sign" in d.files else None
+            self.tsign = {k[len("tsign_"):]: d[k] for k in d.files if k.startswith("tsign_")}
+            if os.environ.get("GT4PY_GLOBAL_NO_SEAM_SIGN"):  # A/B switch: pack without pole-seam signs
+                self.e_sign, self.tsign = None, {}
         self.slots = {}
         for x, g in self.gather.items():
             ii, jj, kk = np.nonzero(owned[x])
@@ -482,17 +506,19 @@ class GlobalPackTables:
             self.slots[x] = slots
 
     @staticmethod
-    def pack(values: np.ndarray, gather: np.ndarray) -> np.ndarray:
+    def pack(values: np.ndarray, gather: np.ndarray, sign: np.ndarray | None = None) -> np.ndarray:
         out = np.zeros((*gather.shape, *values.shape[1:]), dtype=values.dtype, order="F")
         valid = gather >= 0
         out[valid] = values[gather[valid]]
+        if sign is not None:
+            out *= sign.reshape(sign.shape + (1,) * (values.ndim - 1)).astype(values.dtype)
         return out
 
     @staticmethod
     def unpack(struct_values: np.ndarray, slots: np.ndarray) -> np.ndarray:
         return struct_values[slots[:, 0], slots[:, 1], slots[:, 2]]
 
-    def pack_sparse(self, local_dim: str, coeff: np.ndarray) -> np.ndarray:
+    def pack_sparse(self, local_dim: str, coeff: np.ndarray, name: str | None = None) -> np.ndarray:
         idx = self.sparse[local_dim]
         flat = coeff.reshape(-1, *coeff.shape[2:])
         tail = (None,) * (coeff.ndim - 2)
@@ -500,7 +526,15 @@ class GlobalPackTables:
             np.where((idx[..., r] >= 0)[(..., *tail)], flat[np.maximum(idx[..., r], 0)], 0)
             for r in range(idx.shape[-1])
         )
+        centre, target = _GLOBAL_SPARSE_SIGNS.get(name, (False, False))
+        if centre and self.e_sign is not None and local_dim.startswith("E"):
+            out = out * self.e_sign[(..., None, *tail)]
+        if target and local_dim in self.tsign:
+            out = out * self.tsign[local_dim][(..., *tail)]
         return np.asfortranarray(out.astype(coeff.dtype, copy=False))
+
+    def edge_sign_for(self, name: str | None) -> np.ndarray | None:
+        return self.e_sign if name in _GLOBAL_VECTOR_EDGE_FIELDS else None
 
 
 _CACHED_GLOBAL_TABLES: GlobalPackTables | None = None
@@ -1210,7 +1244,7 @@ class GenericStructuredWrapper:
         # Must have a connectivity array available
         return local_dim in self._raw_conn
 
-    def _pack_sparse_local_field(self, field, coeff: np.ndarray) -> np.ndarray:
+    def _pack_sparse_local_field(self, field, coeff: np.ndarray, name: str | None = None) -> np.ndarray:
         """Generic packing of a sparse local-connectivity field into a structured
         (ni, nj, n_kolor, n_local, ...) array, derived from the map_dict remap table.
 
@@ -1219,7 +1253,7 @@ class GenericStructuredWrapper:
         """
         local_dim = self._get_local_dim_name(field)
         if self.global_tables is not None:
-            return self.global_tables.pack_sparse(local_dim, coeff)
+            return self.global_tables.pack_sparse(local_dim, coeff, name)
         conn = self._raw_conn.get(local_dim)
         if conn is None:
             ni, nj, n_kolor = self.index_map.ijk_to_edge.shape
@@ -1405,7 +1439,7 @@ class GenericStructuredWrapper:
             )
         return gtx.as_field(dims, data, allocator=allocator)
 
-    def _pack_argument(self, field, shift_i: int = 0, shift_j: int = 0):
+    def _pack_argument(self, field, shift_i: int = 0, shift_j: int = 0, name: str | None = None):
         if not getattr(field, "domain", None):
             return field
 
@@ -1413,7 +1447,7 @@ class GenericStructuredWrapper:
 
         if self._is_sparse_local_field(field, np_data):
             local_dim = field.domain.dims[1]
-            struct_np = self._pack_sparse_local_field(field, np_data)
+            struct_np = self._pack_sparse_local_field(field, np_data, name)
             trailing_dims = list(field.domain.dims[2:]) if np_data.ndim > 2 else []
             # Origin approach: full array + coordinate-origin shift (no slicing).
             # The DaCe kernel accesses ptr[i + shift_i] which equals the original position.
@@ -1431,7 +1465,8 @@ class GenericStructuredWrapper:
             for entity, x in (("Vertex", "v"), ("Edge", "e"), ("Cell", "c")):
                 if self._is_unstructured(field, entity):
                     trailing_dims = list(field.domain.dims[1:]) if np_data.ndim > 1 else []
-                    struct_np = GlobalPackTables.pack(np_data, self.global_tables.gather[x])
+                    sign = self.global_tables.edge_sign_for(name) if x == "e" else None
+                    struct_np = GlobalPackTables.pack(np_data, self.global_tables.gather[x], sign)
                     return self._make_structured_field(
                         [IDim, JDim, Kolor, *trailing_dims], struct_np, trailing_dims, shift_i, shift_j
                     )
@@ -1592,7 +1627,7 @@ class GenericStructuredWrapper:
                         packed_fields.append((original_field, packed_field))
             else:
                 # print(f"Packing argument '{arg_name}' for operator '{self.operator_name}'")
-                packed_arg = self._pack_argument(arg_val, _pack_shift_i, _pack_shift_j)
+                packed_arg = self._pack_argument(arg_val, _pack_shift_i, _pack_shift_j, arg_name)
                 structured_kwargs[arg_name] = packed_arg
                 if getattr(arg_val, "domain", None) is not None:
                     packed_fields.append((arg_val, packed_arg))
