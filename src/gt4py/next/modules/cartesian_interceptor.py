@@ -458,9 +458,106 @@ def _build_periodic_square_index_map(e2v: np.ndarray) -> tuple[IndexMap, Structu
     )
     return index_map, remap_sizes
 
+class GlobalPackTables:
+    """Pack tables of the global 10-rhombus grid (icon4py_kb/scripts/pack_tables.py --save, halo_exchange.md §8.2).
+
+    gather[x] [I, J, Kolor]: global index or -1 per slot, including halo slots (one global index may fill several slots).
+    slots[x] [n_entity, 3]: the owned (I, J, Kolor) slot of every entity (pack/unpack go gather -> compute -> owned).
+    sparse[conn] [I, J, Kolor, slot, mult]: flat index into icon4py's [entity, local] coefficients, in map_dict slot order.
+    """
+
+    def __init__(self, path: str):
+        with np.load(path) as d:
+            self.gather = {x: d[f"{x}_gather"].astype(np.int64) for x in ("v", "e", "c")}
+            owned = {x: d[f"{x}_owned"] for x in ("v", "e", "c")}
+            self.sparse = {
+                k[len("sparse_"):]: d[k].astype(np.int64) for k in d.files if k.startswith("sparse_")
+            }
+        self.slots = {}
+        for x, g in self.gather.items():
+            ii, jj, kk = np.nonzero(owned[x])
+            slots = -np.ones((int(g.max()) + 1, 3), dtype=np.int32)
+            slots[g[ii, jj, kk]] = np.stack([ii, jj, kk], axis=1)
+            assert (slots >= 0).all(), f"{path}: {x} entity without owned slot"
+            self.slots[x] = slots
+
+    @staticmethod
+    def pack(values: np.ndarray, gather: np.ndarray) -> np.ndarray:
+        out = np.zeros((*gather.shape, *values.shape[1:]), dtype=values.dtype, order="F")
+        valid = gather >= 0
+        out[valid] = values[gather[valid]]
+        return out
+
+    @staticmethod
+    def unpack(struct_values: np.ndarray, slots: np.ndarray) -> np.ndarray:
+        return struct_values[slots[:, 0], slots[:, 1], slots[:, 2]]
+
+    def pack_sparse(self, local_dim: str, coeff: np.ndarray) -> np.ndarray:
+        idx = self.sparse[local_dim]
+        flat = coeff.reshape(-1, *coeff.shape[2:])
+        tail = (None,) * (coeff.ndim - 2)
+        out = sum(
+            np.where((idx[..., r] >= 0)[(..., *tail)], flat[np.maximum(idx[..., r], 0)], 0)
+            for r in range(idx.shape[-1])
+        )
+        return np.asfortranarray(out.astype(coeff.dtype, copy=False))
+
+
+_CACHED_GLOBAL_TABLES: GlobalPackTables | None = None
+
+
+def get_global_pack_tables() -> GlobalPackTables | None:
+    """Tables from GT4PY_GLOBAL_PACK_TABLES (global grid mode), or None (Raphael's parallelogram mode)."""
+    global _CACHED_GLOBAL_TABLES
+    path = os.environ.get("GT4PY_GLOBAL_PACK_TABLES")
+    if not path:
+        return None
+    if _CACHED_GLOBAL_TABLES is None:
+        _CACHED_GLOBAL_TABLES = GlobalPackTables(path)
+    return _CACHED_GLOBAL_TABLES
+
+
+def _global_grid_mapping(tables: GlobalPackTables) -> tuple[IndexMap, StructuredRemapSizes]:
+    """IndexMap view of the pack tables: ijk_to_edge / ij_to_vertex = gather, edge_to_ijk / vertex_to_ij = owned slot."""
+    ni, nj, _ = tables.gather["e"].shape
+    index_map = IndexMap(
+        vertex_to_ij=tables.slots["v"][:, :2],
+        row_lengths=np.full((ni,), nj, dtype=np.int32),
+        row_offsets=(np.arange(ni, dtype=np.int32) * nj).astype(np.int32),
+        ij_to_vertex=tables.gather["v"][:, :, 0].astype(np.int32),
+        edge_to_ijk=tables.slots["e"],
+        ijk_to_edge=tables.gather["e"].astype(np.int32),
+    )
+    remap_sizes = StructuredRemapSizes(
+        nx=ni,
+        ny=nj,
+        max_i=ni,
+        max_j=nj,
+        vertex_size=len(tables.slots["v"]),
+        edge_size_padded=3 * ni * nj,
+        cell_size=len(tables.slots["c"]),
+        end_i=ni,
+        end_j=nj,
+    )
+    return index_map, remap_sizes
+
+
 def get_global_grid_mapping(e2v_override=None):
     """Builds or returns the cached index_map and remap_sizes for the current run."""
     global _CACHED_INDEX_MAP, _CACHED_REMAP_SIZES, _CACHED_EDGE_COUNT
+
+    tables = get_global_pack_tables()
+    if tables is not None:
+        if e2v_override is not None:
+            n_edge = int(np.asarray(e2v_override).shape[0])
+            if n_edge != len(tables.slots["e"]):
+                raise ValueError(
+                    f"GT4PY_GLOBAL_PACK_TABLES has {len(tables.slots['e'])} edges, the grid {n_edge}."
+                )
+        if _CACHED_INDEX_MAP is None:
+            _CACHED_INDEX_MAP, _CACHED_REMAP_SIZES = _global_grid_mapping(tables)
+            _CACHED_EDGE_COUNT = len(tables.slots["e"])
+        return _CACHED_INDEX_MAP, _CACHED_REMAP_SIZES
 
     override_edge_count = None
     normalized_e2v_override = None
@@ -529,7 +626,11 @@ class GenericStructuredWrapper:
         self.c2v_conn = offset_provider.get("C2V").asnumpy() if "C2V" in offset_provider else None
         self.cell_to_ijk = None
         self.ijk_to_cell = None
-        if self.c2v_conn is not None:
+        self.global_tables = get_global_pack_tables()
+        if self.global_tables is not None:
+            self.cell_to_ijk = self.global_tables.slots["c"]
+            self.ijk_to_cell = self.global_tables.gather["c"].astype(np.int32)
+        elif self.c2v_conn is not None:
             self.cell_to_ijk, self.ijk_to_cell = build_cell_ijk_maps(self.c2v_conn, self.index_map)
 
         # Raw connectivity arrays for all sparse local-connectivity types in the offset_provider.
@@ -541,7 +642,8 @@ class GenericStructuredWrapper:
                 if hasattr(value, "asnumpy"):
                     arr = value.asnumpy()
                     if arr.ndim == 2:
-                        if key_name == "E2C":
+                        # The lattice-oriented global grid file already has E2C in map_dict order.
+                        if key_name == "E2C" and self.global_tables is None:
                             if self.index_map is not None:
                                 edge_to_ijk = getattr(self.index_map, "edge_to_ijk", None)
                                 if edge_to_ijk is not None:
@@ -1103,6 +1205,8 @@ class GenericStructuredWrapper:
             return False
         if local_dim not in _SPARSE_REMAP_TABLE:
             return False
+        if self.global_tables is not None:
+            return local_dim in self.global_tables.sparse
         # Must have a connectivity array available
         return local_dim in self._raw_conn
 
@@ -1114,6 +1218,8 @@ class GenericStructuredWrapper:
         (e.g. E2C2E, E2C2EO, E2C, C2E, V2E, E2C2V, …).
         """
         local_dim = self._get_local_dim_name(field)
+        if self.global_tables is not None:
+            return self.global_tables.pack_sparse(local_dim, coeff)
         conn = self._raw_conn.get(local_dim)
         if conn is None:
             ni, nj, n_kolor = self.index_map.ijk_to_edge.shape
@@ -1321,6 +1427,16 @@ class GenericStructuredWrapper:
                 allocator=self.allocator,
             )
 
+        if self.global_tables is not None:
+            for entity, x in (("Vertex", "v"), ("Edge", "e"), ("Cell", "c")):
+                if self._is_unstructured(field, entity):
+                    trailing_dims = list(field.domain.dims[1:]) if np_data.ndim > 1 else []
+                    struct_np = GlobalPackTables.pack(np_data, self.global_tables.gather[x])
+                    return self._make_structured_field(
+                        [IDim, JDim, Kolor, *trailing_dims], struct_np, trailing_dims, shift_i, shift_j
+                    )
+            return field
+
         if self._is_unstructured(field, "Vertex"):
             trailing_dims = list(field.domain.dims[1:]) if np_data.ndim > 1 else []
             # Full pack + origin: vertex accesses at ptr[i_logical + shift_i] = ptr[i_original]. ✓
@@ -1386,7 +1502,15 @@ class GenericStructuredWrapper:
             ):
                 struct_np = struct_np[: self.ijk_to_cell.shape[0]]
 
-        if self._is_unstructured(original_unstructured_field, "Vertex"):
+        if self.global_tables is not None:
+            # Halo slots hold copies of other entities: read back from the owned slot only.
+            for entity, x in (("Vertex", "v"), ("Edge", "e"), ("Cell", "c")):
+                if self._is_unstructured(original_unstructured_field, entity):
+                    unstruct_np = GlobalPackTables.unpack(struct_np, self.global_tables.slots[x])
+                    break
+            else:
+                return
+        elif self._is_unstructured(original_unstructured_field, "Vertex"):
             # Origin approach: struct_np is the full vertex array at original positions.
             # vertex_to_ij maps flat vertex index → (i_original, j_original).
             unstruct_np = unpack_vertex_field_to_unstructured(struct_np, self.index_map)
