@@ -45,7 +45,7 @@ class ScanOperator(EmbeddedOperator[xtyping.MaybeNestedInTuple[core_defs.ScalarT
         common.Field[Any, core_defs.ScalarT]
         | tuple[common.Field[Any, core_defs.ScalarT] | tuple, ...]
     ):
-        scan_range = embedded_context.get_closure_column_range()
+        scan_range = _scan_range(embedded_context.get_closure_column_range(), self.axis)
         assert self.axis == scan_range.dim
         scan_axis = scan_range.dim
         all_args = [*args, *kwargs.values()]
@@ -140,6 +140,29 @@ def field_operator_call(op: EmbeddedOperator[_R, _P], args: Any, kwargs: Any) ->
             # assuming we wanted to call the field_operator as program, otherwise `offset_provider` would not be there
             raise errors.MissingArgumentError(None, "out", True)
         return op(*args, **kwargs)
+
+
+def _scan_range(
+    closure_column_range: xtyping.MaybeNestedInTuple[common.NamedRange | eve.NothingType],
+    axis: common.Dimension,
+) -> common.NamedRange:
+    # With one domain per output the closure has one vertical range per output: the scan runs
+    # over their hull on its axis, as domain inference does for the compiled backends.
+    def collect(r: Any) -> list[common.NamedRange]:
+        if isinstance(r, common.NamedRange):
+            return [r] if r.dim == axis else []
+        if isinstance(r, tuple):
+            return [nr for el in r for nr in collect(el)]
+        return []
+
+    ranges = collect(closure_column_range)
+    assert ranges, f"No output domain contains the scan axis '{axis}'."
+    return common.NamedRange(
+        axis,
+        common.UnitRange(
+            min(r.unit_range.start for r in ranges), max(r.unit_range.stop for r in ranges)
+        ),
+    )
 
 
 @utils.tree_map

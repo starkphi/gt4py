@@ -699,3 +699,55 @@ def test_direct_fo_nested_no_domain(cartesian_case):
         out=out,
         ref=((a, b), c),
     )
+
+
+@gtx.scan_operator(axis=KDim, forward=True, init=0.0)
+def scan_cumsum(acc: float, x: float) -> float:
+    return acc + x
+
+
+@gtx.field_operator
+def fop_scan(a: cases.IKFloatField) -> tuple[cases.IKFloatField, cases.IKFloatField]:
+    s = scan_cumsum(a)
+    return s, 2.0 * s
+
+
+@gtx.program
+def prog_scan_different_vertical_domains(
+    a: cases.IKFloatField,
+    out_a: cases.IKFloatField,
+    out_b: cases.IKFloatField,
+    i_size: gtx.int32,
+    k_size: gtx.int32,
+):
+    fop_scan(
+        a,
+        out=(out_a, out_b),
+        domain=(
+            {IDim: (0, i_size), KDim: (0, k_size)},
+            {IDim: (0, i_size), KDim: (k_size - 1, k_size)},
+        ),
+    )
+
+
+@pytest.mark.uses_scan
+@pytest.mark.uses_tuple_returns
+def test_program_scan_different_vertical_domains(cartesian_case):
+    a = cases.allocate(cartesian_case, prog_scan_different_vertical_domains, "a")()
+    out_a = cases.allocate(cartesian_case, prog_scan_different_vertical_domains, "out_a")()
+    out_b = cases.allocate(cartesian_case, prog_scan_different_vertical_domains, "out_b")()
+    ref_a = np.cumsum(a.asnumpy(), axis=1)
+    ref_b = out_b.asnumpy().copy()
+    ref_b[:, -1] = 2.0 * ref_a[:, -1]
+
+    cases.verify(
+        cartesian_case,
+        prog_scan_different_vertical_domains,
+        a,
+        out_a,
+        out_b,
+        cartesian_case.default_sizes[IDim],
+        cartesian_case.default_sizes[KDim],
+        inout=(out_a, out_b),
+        ref=(ref_a, ref_b),
+    )
