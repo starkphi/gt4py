@@ -282,10 +282,10 @@ class Column(np.lib.mixins.NDArrayOperatorsMixin):
     @property
     def dtype(self) -> np.dtype:
         # not directly dtype of `self.data` as that might be a structured type containing `None`
-        return _elem_dtype(self.data[self.kstart])
+        return _elem_dtype(self.data[0])
 
     def __gt_type__(self) -> ts.TypeSpec:
-        elem = self.data[self.kstart]
+        elem = self.data[0]
         return type_translation.from_value(_numpy_structured_value_to_tuples(elem))
 
     def __getitem__(self, i: int) -> Any:
