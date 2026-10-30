@@ -57,6 +57,12 @@ _EDGE_TO_EDGE_CONNECTIVITIES: frozenset[str] = frozenset({"E2C2EO", "E2C2E"})
 #: Threshold parameter name for the 2nd nudge line (edge entity).
 _EDGE_NUDGE_THRESHOLD_ID = "start_2nd_nudge_line_idx_e"
 
+
+def _lateral_boundary_rings(rings: int) -> int:
+    """Rings to strip for interior / nudging thresholds: `rings` on limited-area grids, 0 on the global grid
+    (GT4PY_GLOBAL_PACK_TABLES): no lateral boundary and no nudging zone there, every owned entity is interior."""
+    return 0 if os.environ.get("GT4PY_GLOBAL_PACK_TABLES") else rings
+
 # =====================================================================
 # Module-level cache
 # =====================================================================
@@ -2062,7 +2068,9 @@ class ThresholdConditionRewriter(NodeTranslator):
         if f"{threshold_id}_k0_ilo" in symbolic_domain_sizes:
             interior_cond = self._mapping_based_threshold_condition(threshold_id, 3, symbolic_domain_sizes)
         elif threshold_id == _EDGE_NUDGE_THRESHOLD_ID:
-            interior_cond = self._structured_entity_condition("Edge", program_param_ids, symbolic_domain_sizes, extra_halo=2)
+            interior_cond = self._structured_entity_condition(
+                "Edge", program_param_ids, symbolic_domain_sizes, extra_halo=_lateral_boundary_rings(2)
+            )
         else:
             interior_cond = self._structured_entity_condition("Edge", program_param_ids, symbolic_domain_sizes)
         if interior_cond is None:
@@ -2118,7 +2126,9 @@ class ThresholdConditionRewriter(NodeTranslator):
         if f"{threshold_id}_k0_ilo" in symbolic_domain_sizes:
             interior_cond = self._mapping_based_threshold_condition(threshold_id, 2, symbolic_domain_sizes)
         elif is_interior:
-            interior_cond = self._structured_entity_condition("Cell", program_param_ids, symbolic_domain_sizes, extra_halo=1)
+            interior_cond = self._structured_entity_condition(
+                "Cell", program_param_ids, symbolic_domain_sizes, extra_halo=_lateral_boundary_rings(1)
+            )
         else:
             interior_cond = self._structured_entity_condition("Cell", program_param_ids, symbolic_domain_sizes)
         if interior_cond is None:
