@@ -460,21 +460,95 @@ def _build_periodic_square_index_map(e2v: np.ndarray) -> tuple[IndexMap, Structu
 
 # Pole seams (halo_exchange.md §8.5, option A): at reversed halo edge slots the kernel's implicit normal (lattice E2C[0] -> E2C[1])
 # is the owner's normal reversed, so normal-vector edge data is packed with e_sign (-1 there) into the local frame.
-# Dense edge fields that are normal (or tangential) vector components; edge scalars (theta_v_e, kinetic energy, ...) are not listed.
+# Both lists are by icon4py program argument name and cover every Edge / sparse argument of the dycore, diffusion and common
+# programs (audit: halo_exchange.md §8.8; tracer advection is not classified yet). In global mode an unlisted name raises (_check_global_name), so a new stencil cannot
+# silently miss a sign. Only reads through a neighbour access at a reversed slot see the sign; pointwise and output fields are
+# classified anyway so the check stays total.
+# Dense edge fields that flip with the edge normal: normal / tangential components, their tendencies and fluxes, d/dn and d/dt slopes.
 _GLOBAL_VECTOR_EDGE_FIELDS = frozenset({
-    "vn", "vt", "next_vn", "current_vn", "vec_e", "z_vn_avg", "z_graddiv_vn", "z_nabla2_e", "z_nabla4_e2", "tangential_wind",
-    "horizontal_gradient_of_normal_wind_divergence", "predictor_normal_wind_advective_tendency",
+    # normal wind and its time levels / averages
+    "vn", "next_vn", "current_vn", "vn_new", "vn_now", "vn_nnew", "vn_nnow", "vn_traj", "vn_ie", "vn_on_half_levels",
+    "vec_e", "p_vn_in", "p_e_in", "z_vn_avg", "spatially_averaged_vn", "substep_and_spatially_averaged_vn",
+    "flux_or_velocity", "spatially_averaged_flux_or_velocity", "interpolant", "interpolation_to_half_levels_vp",
+    # tangential wind
+    "vt", "p_vt_out", "tangential_wind", "tangential_wind_on_half_levels", "z_vt_ie",
+    # tendencies, increments, gradients along the normal
+    "ddt_vn_apc", "ddt_vn_apc_ntl1", "ddt_vn_apc_ntl2", "ddt_vn_phy", "predictor_normal_wind_advective_tendency",
     "corrector_normal_wind_advective_tendency", "normal_wind_advective_tendency", "normal_wind_tendency_due_to_slow_physics_process",
-    "normal_wind_iau_increment", "horizontal_pressure_gradient", "vn_on_half_levels", "grf_tend_vn", "mass_fl_e", "z_rho_e",
+    "normal_wind_iau_increment", "vn_incr", "grf_tend_vn", "horizontal_pressure_gradient", "z_gradh_exner",
+    "hydrostatic_correction_on_lowest_level", "z_hydro_corr", "horizontal_gradient_of_normal_wind_divergence",
+    "z_graddiv_vn", "z_graddiv2_vn", "z_nabla2_e", "z_nabla4_e2",
+    # normal fluxes
+    "mass_fl_e", "mass_flx_me", "mass_flux_at_edges_on_model_levels", "substep_averaged_mass_flux",
+    "theta_v_flux_at_edges_on_model_levels", "z_theta_v_fl_e",
+    # terrain slopes along normal / tangent (average_two_vertical_levels_downwards_on_edges gets ddxn/ddxt_z_half_e)
+    "ddxn_z_full", "ddxt_z_full", "ddxn_z_half_e", "ddxt_z_half_e", "input_field", "average",
+    # back-trajectory distances in the edge's (normal, tangent) frame
+    "p_distv_bary_1", "p_distv_bary_2",
+    # Cartesian / local components of the edge normal and tangent (geometry, pointwise)
+    "normal_x", "normal_y", "normal_z", "tangent_x", "tangent_y", "tangent_z", "normal_u", "normal_v", "tangent_u", "tangent_v",
 })
-# Sparse coefficients: (sign of the centre edge: output is a normal component, sign of the target edge: multiplies a vector field).
+# Dense edge fields that do not flip: scalars at edges, geographic (u, v) components, metrics, masks, geometry, and
+# relative orientations (tangent_orientation, edge_orientation: normal and tangent flip together, E2V order with them).
+_GLOBAL_SCALAR_EDGE_FIELDS = frozenset({
+    "z_rho_e", "rho_at_edges_on_model_levels", "z_theta_v_e", "theta_v_at_edges_on_model_levels", "z_kin_hor_e",
+    "horizontal_kinetic_energy_at_edges_on_model_levels", "z_w_concorr_me", "contravariant_correction_at_edges_on_model_levels",
+    "z_v_grad_w", "horizontal_advection_of_w_at_edges_on_half_levels", "kh_smag_e", "kh_smag_ec",
+    "reference_rho_at_edges_on_model_levels", "reference_theta_at_edges_on_model_levels", "rho_ref_me", "theta_ref_me",
+    "edge_kdim_field_with_zero_wp_1", "edge_kdim_field_with_zero_wp_2", "out_field",
+    "wgtfac_e", "wgtfacq_e", "ddqz_z_full_e", "pg_exdist", "pg_exdist_dsl", "e_lev", "flat_idx_max", "nudgecoeff_e", "nudging_coefficients_for_edges", "refin_ctrl", "e_refin_ctrl",
+    "hmask_dd3d", "horizontal_mask_for_3d_divdamp", "owner_mask", "e_owner_mask",
+    "area", "area_edge", "length", "primal_edge_length", "dual_edge_length", "far_vertex_distance", "inv_dual_edge_length",
+    "inv_primal_edge_length", "inv_vert_vert_length", "f", "f_inverse", "coriolis_frequency", "coriolis_parameter",
+    "tangent_orientation", "edge_orientation", "lat", "lon", "edge_lat", "edge_lon", "edge_center_lat", "edge_x", "edge_y",
+    "edge_neighbor_0_lat", "edge_neighbor_0_lon", "edge_neighbor_1_lat", "edge_neighbor_1_lon",
+    "u", "v", "x", "y", "z", "u_cell_1", "u_cell_2", "v_cell_1", "v_cell_2",
+    "u_vertex_1", "u_vertex_2", "u_vertex_3", "u_vertex_4", "v_vertex_1", "v_vertex_2", "v_vertex_3", "v_vertex_4",
+})
+assert not _GLOBAL_VECTOR_EDGE_FIELDS & _GLOBAL_SCALAR_EDGE_FIELDS
+# Sparse coefficients: (sign of the centre edge, sign of the target edge). Centre: the coefficient carries the centre edge's
+# orientation (projects onto / differentiates along its normal or tangent); lattice-ordered differences (x[E2C[1]] - x[E2C[0]])
+# flip by themselves and need no sign. Target: it multiplies a vector edge field read at the target slot (edge targets only).
+# A coefficient and the field it multiplies are signed together: one-hop sums at owned centres stay unchanged (sign^2 = 1).
 _GLOBAL_SPARSE_SIGNS = {
-    "geofac_grdiv": (True, True), "e_flx_avg": (True, True), "rbf_vec_coeff_e": (True, True),
-    "geofac_div": (False, True), "geofac_rot": (False, True), "rbf_vec_coeff_v": (False, True),
+    "geofac_grdiv": (True, True), "e_flx_avg": (True, True), "rbf_vec_coeff_e": (True, True), "ptr_coeff": (True, True),
+    # vn -> divergence / vorticity / (u, v) at cells (C2E, C2E2C2E) and vertices (V2E; rbf_vec_coeff_v is passed as ptr_coeff_1/2)
+    "geofac_div": (False, True), "geofac_rot": (False, True), "ptr_coeff_1": (False, True), "ptr_coeff_2": (False, True),
+    # edge normal / tangent in the neighbour's frame, cell positions in the edge's (normal, tangent) frame
     "coeff_gradekin": (True, False), "primal_normal_vert_v1": (True, False), "primal_normal_vert_v2": (True, False),
     "primal_normal_vert_x": (True, False), "primal_normal_vert_y": (True, False),
     "dual_normal_vert_x": (True, False), "dual_normal_vert_y": (True, False),
+    "primal_normal_cell_1": (True, False), "primal_normal_cell_2": (True, False),
+    "primal_normal_cell_x": (True, False), "primal_normal_cell_y": (True, False),
+    "dual_normal_cell_1": (True, False), "dual_normal_cell_2": (True, False),
+    "dual_normal_cell_x": (True, False), "dual_normal_cell_y": (True, False),
+    "pos_on_tplane_e_1": (True, False), "pos_on_tplane_e_2": (True, False),
+    "pos_on_tplane_e_x": (True, False), "pos_on_tplane_e_y": (True, False),
+    # scalar interpolation / gradient weights and vertical offsets
+    "e_bln_c_s": (False, False), "c_lin_e": (False, False), "coeff": (False, False), "geofac_n2s": (False, False),
+    "geofac_n2s_nbh": (False, False), "geofac_grg_x": (False, False), "geofac_grg_y": (False, False),
+    "vcoef": (False, False), "zd_vertoffset": (False, False), "zdiff_gradp": (False, False), "ikoffset": (False, False),
+    "c_int": (False, False), "c_intp": (False, False), "c_bln_avg": (False, False),
 }
+
+
+def _check_global_name(name: str | None, kind: str, local_dim: str | None = None) -> None:
+    """Global mode: every Edge / sparse argument must be classified, else its pole-seam sign could be silently wrong."""
+    if kind == "edge":
+        if name not in _GLOBAL_VECTOR_EDGE_FIELDS and name not in _GLOBAL_SCALAR_EDGE_FIELDS:
+            raise ValueError(
+                f"GT4PY_GLOBAL_PACK_TABLES: edge argument {name!r} is in neither _GLOBAL_VECTOR_EDGE_FIELDS nor "
+                "_GLOBAL_SCALAR_EDGE_FIELDS (cartesian_interceptor.py); classify it (halo_exchange.md §8.8)."
+            )
+        return
+    if name not in _GLOBAL_SPARSE_SIGNS:
+        raise ValueError(
+            f"GT4PY_GLOBAL_PACK_TABLES: sparse argument {name!r} [{local_dim}] is not in _GLOBAL_SPARSE_SIGNS "
+            "(cartesian_interceptor.py); classify it (halo_exchange.md §8.8)."
+        )
+    centre, target = _GLOBAL_SPARSE_SIGNS[name]
+    if (centre and not local_dim.startswith("E")) or (target and not local_dim.endswith(("2E", "2EO"))):
+        raise ValueError(f"_GLOBAL_SPARSE_SIGNS[{name!r}] = {(centre, target)} does not fit {local_dim}.")
 
 
 class GlobalPackTables:
@@ -522,6 +596,7 @@ class GlobalPackTables:
         idx = self.sparse[local_dim]
         flat = coeff.reshape(-1, *coeff.shape[2:])
         tail = (None,) * (coeff.ndim - 2)
+        _check_global_name(name, "sparse", local_dim)
         out = sum(
             np.where((idx[..., r] >= 0)[(..., *tail)], flat[np.maximum(idx[..., r], 0)], 0)
             for r in range(idx.shape[-1])
@@ -534,6 +609,7 @@ class GlobalPackTables:
         return np.asfortranarray(out.astype(coeff.dtype, copy=False))
 
     def edge_sign_for(self, name: str | None) -> np.ndarray | None:
+        _check_global_name(name, "edge")
         return self.e_sign if name in _GLOBAL_VECTOR_EDGE_FIELDS else None
 
 
@@ -1620,7 +1696,7 @@ class GenericStructuredWrapper:
             if arg_name == "offset_provider":
                 continue
             if isinstance(arg_val, tuple):
-                packed_tuple = tuple(self._pack_argument(f, _pack_shift_i, _pack_shift_j) for f in arg_val)
+                packed_tuple = tuple(self._pack_argument(f, _pack_shift_i, _pack_shift_j, arg_name) for f in arg_val)
                 structured_kwargs[arg_name] = packed_tuple
                 for original_field, packed_field in zip(arg_val, packed_tuple, strict=False):
                     if getattr(original_field, "domain", None) is not None:
