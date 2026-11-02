@@ -30,6 +30,19 @@ _NON_CONTIGUOUS_DOMAIN_WARNING_THRESHOLD: float = 1 / 4
 _NON_CONTIGUOUS_DOMAIN_WARNING_SKIPPED_OFFSET_TAGS: set[str] = set()
 
 
+def _static_bound(bound: itir.Expr) -> int | None:
+    """Integer value of a range bound: an integer `Literal`, or an integer `OffsetLiteral` (the structured backend
+    writes Cartesian bounds as `OffsetLiteral`, e.g. `190ₒ`). None if not static."""
+    if isinstance(bound, itir.Literal):
+        try:
+            return int(bound.value)
+        except ValueError:
+            return None
+    if isinstance(bound, itir.OffsetLiteral) and isinstance(bound.value, int):
+        return bound.value
+    return None
+
+
 @dataclasses.dataclass(frozen=True)
 class SymbolicRange:
     start: itir.Expr
@@ -44,8 +57,8 @@ class SymbolicRange:
         return SymbolicRange(im.plus(self.start, distance), im.plus(self.stop, distance))
 
     def empty(self) -> bool | None:
-        if isinstance(self.start, itir.Literal) and isinstance(self.stop, itir.Literal):
-            start, stop = int(self.start.value), int(self.stop.value)
+        start, stop = _static_bound(self.start), _static_bound(self.stop)
+        if start is not None and stop is not None:
             return start >= stop
         elif self.start == self.stop:
             return True
