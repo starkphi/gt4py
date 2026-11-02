@@ -276,7 +276,13 @@ def _build_field_concat_where_from_branches(
     inferred_kolor_start: int | None = None,
     apply_edge_shape_bounds: bool = False,
     current_kolor: int | None = None,
+    make_branch=None,
 ) -> ir.Expr:
+    """`make_branch(shift_spec, branch_domain)` builds one Kolor branch; default: the lifted deref-shift of `arg`.
+    A custom builder (Path 1b) puts a whole stencil into each branch, with the Kolor safeguards below unchanged."""
+    if make_branch is None:
+        def make_branch(spec, dom):
+            return _make_lifted_deref_shift(arg, spec, dom)
     def _extract_kolor_interval(cond_expr: ir.Expr | None) -> tuple[int, int] | None:
         if cond_expr is None or not cpm.is_call_to(cond_expr, "cartesian_domain"):
             return None
@@ -408,7 +414,7 @@ def _build_field_concat_where_from_branches(
                     ed = _edge_shape_domain(k, shift_spec, current_kolor=current_kolor)
                     if ed is not None:
                         branch_domain = ed
-                return _make_lifted_deref_shift(arg, shift_spec, branch_domain)
+                return make_branch(shift_spec, branch_domain)
             fallback_spec = shift_spec
         if fallback_spec is not None:
             branch_domain = domain
@@ -416,7 +422,7 @@ def _build_field_concat_where_from_branches(
                 ed = _edge_shape_domain(current_kolor, fallback_spec, current_kolor=current_kolor)
                 if ed is not None:
                     branch_domain = ed
-            return _make_lifted_deref_shift(arg, fallback_spec, branch_domain)
+            return make_branch(fallback_spec, branch_domain)
 
     cond, shift_spec = branches[0]
     source_kolor, next_inferred_kolor = _infer_source_kolor_from_cond(cond, inferred_kolor_start)
@@ -429,7 +435,7 @@ def _build_field_concat_where_from_branches(
         narrowed = _narrow_kolor(branch_domain, source_kolor)
         if narrowed is not None:
             branch_domain = narrowed
-    expr = _make_lifted_deref_shift(arg, shift_spec, branch_domain)
+    expr = make_branch(shift_spec, branch_domain)
     if len(branches) == 1:
         return expr
     return im.concat_where(
@@ -440,6 +446,7 @@ def _build_field_concat_where_from_branches(
             inferred_kolor_start=next_inferred_kolor,
             apply_edge_shape_bounds=apply_edge_shape_bounds,
             current_kolor=current_kolor,
+            make_branch=make_branch,
         ),
     )
 
@@ -2831,6 +2838,14 @@ class NeighborReductionUnroller(NodeTranslator):
         #   Matches stencils that are just lifted field accesses (already fieldop-wrapped shifts).
         #   Mutually exclusive with Path 2 (reduce) and Path 3 (raw shift): an as_fieldop with a
         #   pure deref-shift stencil cannot simultaneously be a reduce or a bare shift node.
+        # Path 1b — neighbour shift inside a stencil with a dynamic shift (from InlineDynamicShifts):
+        #   as_fieldop(λ(f, off). deref(shift(E2C, s)(shift(Koff, deref(off))(f))), domain)(field, offset)
+        #   The Kolor choice cannot live inside the stencil, so copy the whole stencil once per
+        #   Kolor branch with the neighbour shift replaced by that branch's Cartesian shift, and
+        #   select the copies with a field-level concat_where (same builder and safeguards as Path 1).
+        if cpm.is_applied_as_fieldop(node) and (rewritten := self._rewrite_stencil_per_kolor(node, current_domain, _ck, kwargs)) is not None:
+            return rewritten
+
         if cpm.is_applied_as_fieldop(node) and len(node.args) == 1:
             stencil = node.fun.args[0]
             if (
@@ -2900,6 +2915,62 @@ class NeighborReductionUnroller(NodeTranslator):
                     return _build_concat_where_from_branches(arg, entry["branches"])
 
         return new_node
+
+    def _rewrite_stencil_per_kolor(self, node: ir.FunCall, current_domain, ck, kwargs) -> ir.Expr | None:
+        """Path 1b. Only for stencils that contain a dynamic shift (offset read from a field) and exactly one
+        neighbour shift with a Kolor-dependent Cartesian form (map_dict kind "concat_where"). None = not handled."""
+        stencil = node.fun.args[0]
+        if not isinstance(stencil, ir.Lambda):
+            return None
+
+        applied_shifts = [
+            n for n in stencil.expr.pre_walk_values()
+            if isinstance(n, ir.FunCall) and cpm.is_applied_shift(n)
+        ]
+        if not any(
+            not isinstance(a, ir.OffsetLiteral) for n in applied_shifts for a in n.fun.args
+        ):
+            return None  # no dynamic shift: Paths 1/2/3 as before
+        if any(cpm.is_call_to(n, ("reduce", "neighbors")) for n in stencil.expr.pre_walk_values()):
+            return None
+
+        kolor_keys = {
+            tuple(n.fun.args) for n in applied_shifts
+            if tuple(n.fun.args) in map_dict and map_dict[tuple(n.fun.args)]["kind"] == "concat_where"
+        }
+        if len(kolor_keys) != 1:
+            return None  # none, or several Kolor-dependent neighbour shifts (not needed so far)
+        (key,) = kolor_keys
+        entry = cast(dict[str, object], map_dict[key])
+        conn_name, is_ene = _conn_name_and_is_edge_to_non_edge(key)
+
+        class _SubstituteShift(NodeTranslator):
+            def __init__(self, spec):
+                self.spec = spec
+
+            def visit_FunCall(self, n: ir.FunCall, **kw) -> ir.Expr:
+                n = self.generic_visit(n, **kw)
+                if cpm.is_applied_shift(n) and tuple(n.fun.args) in map_dict:
+                    e = map_dict[tuple(n.fun.args)]
+                    spec = self.spec if tuple(n.fun.args) == key else (e["shifts"] if e["kind"] == "shift" else None)
+                    if spec is not None:
+                        return _apply_shift_chain(n.args[0], cast(tuple[ir.OffsetLiteral, ...], spec))
+                return n
+
+        new_args = [self.visit(a, **kwargs) for a in node.args]
+
+        def make_branch(spec, dom):
+            branch_stencil = _SubstituteShift(spec).visit(copy.deepcopy(stencil))
+            return im.as_fieldop(branch_stencil, dom)(*[copy.deepcopy(a) for a in new_args])
+
+        return _build_field_concat_where_from_branches(
+            new_args[0] if new_args else None,
+            cast(tuple, entry["branches"]),
+            current_domain,
+            apply_edge_shape_bounds=_needs_edge_shape_bounds(conn_name or None),
+            current_kolor=ck(is_ene),
+            make_branch=make_branch,
+        )
 
     @classmethod
     def apply(cls, node: ir.Node, **kwargs) -> ir.Node:
