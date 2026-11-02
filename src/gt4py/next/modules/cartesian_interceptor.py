@@ -627,6 +627,12 @@ def get_global_pack_tables() -> GlobalPackTables | None:
     return _CACHED_GLOBAL_TABLES
 
 
+def _trailing_starts(field) -> dict:
+    """Start index of every non-horizontal dim of an unstructured field (dims after the first)."""
+    dom = field.domain
+    return {d: int(r.start) for d, r in zip(dom.dims[1:], dom.ranges[1:])}
+
+
 def _check_zone_thresholds(kwargs: dict, n_entity: dict[str, int]) -> None:
     """The structured passes translate the thresholds in ZONE_THRESHOLDS from their zone where the zone is a fixed
     region ("none" / "owned" / "all", see zone_region_below), not from the integer. Check that the integer passed
@@ -1454,7 +1460,7 @@ class GenericStructuredWrapper:
             return out
         return None
 
-    def _make_structured_field(self, dims, struct_np, trailing_dims, shift_i, shift_j):
+    def _make_structured_field(self, dims, struct_np, trailing_dims, shift_i, shift_j, trailing_starts=None):
         """Build the structured GT4Py field, optionally re-laying-out the vertical K axis.
 
         Default: pass the (F-order, K-outermost) packed array straight to ``as_field``.
@@ -1534,10 +1540,15 @@ class GenericStructuredWrapper:
                         order="F",
                     )
                     data, allocator = phys.transpose(0, 2, 3, 1), cp
-        if shift_i > 0:
-            return gtx.as_field(
-                dims, data, origin={IDim: shift_i, JDim: shift_j}, allocator=allocator
-            )
+        origin = {IDim: shift_i, JDim: shift_j} if shift_i > 0 else {}
+        # Keep the original start of trailing dims (e.g. an output allocated only on K = [nlev-1, nlev)):
+        # as_field(origin={K: -s}) gives the range [s, s + size). Without it the kernel writes K = nlev-1
+        # into a 1-level buffer starting at 0 (out of bounds).
+        for dim, start in (trailing_starts or {}).items():
+            if start:
+                origin[dim] = -start
+        if origin:
+            return gtx.as_field(dims, data, origin=origin, allocator=allocator)
         return gtx.as_field(dims, data, allocator=allocator)
 
     def _pack_argument(self, field, shift_i: int = 0, shift_j: int = 0, name: str | None = None):
@@ -1569,7 +1580,8 @@ class GenericStructuredWrapper:
                     sign = self.global_tables.edge_sign_for(name) if x == "e" else None
                     struct_np = GlobalPackTables.pack(np_data, self.global_tables.gather[x], sign)
                     return self._make_structured_field(
-                        [IDim, JDim, Kolor, *trailing_dims], struct_np, trailing_dims, shift_i, shift_j
+                        [IDim, JDim, Kolor, *trailing_dims], struct_np, trailing_dims, shift_i, shift_j,
+                        trailing_starts=_trailing_starts(field),
                     )
             return field
 
@@ -1579,7 +1591,8 @@ class GenericStructuredWrapper:
             # V2E/E2C2V neighbor reads also stay in bounds because the shift cancels.
             struct_np = pack_vertex_field_to_structured(np_data, self.index_map)
             return self._make_structured_field(
-                [IDim, JDim, Kolor, *trailing_dims], struct_np, trailing_dims, shift_i, shift_j
+                [IDim, JDim, Kolor, *trailing_dims], struct_np, trailing_dims, shift_i, shift_j,
+                trailing_starts=_trailing_starts(field),
             )
 
         elif self._is_unstructured(field, "Edge"):
@@ -1587,7 +1600,8 @@ class GenericStructuredWrapper:
             # Full pack + origin: edge accesses at ptr[i_logical + shift_i] = ptr[i_original]. ✓
             struct_np = pack_edge_field(np_data, self.index_map)
             return self._make_structured_field(
-                [IDim, JDim, Kolor, *trailing_dims], struct_np, trailing_dims, shift_i, shift_j
+                [IDim, JDim, Kolor, *trailing_dims], struct_np, trailing_dims, shift_i, shift_j,
+                trailing_starts=_trailing_starts(field),
             )
 
         elif self._is_unstructured(field, "Cell"):
@@ -1596,7 +1610,8 @@ class GenericStructuredWrapper:
             struct_np = pack_cell_field_to_structured(np_data, self.cell_to_ijk, self.ijk_to_cell)
             trailing_dims = list(field.domain.dims[1:]) if np_data.ndim > 1 else []
             return self._make_structured_field(
-                [IDim, JDim, Kolor, *trailing_dims], struct_np, trailing_dims, shift_i, shift_j
+                [IDim, JDim, Kolor, *trailing_dims], struct_np, trailing_dims, shift_i, shift_j,
+                trailing_starts=_trailing_starts(field),
             )
 
         return field
