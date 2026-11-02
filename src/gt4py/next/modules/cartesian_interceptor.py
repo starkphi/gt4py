@@ -627,6 +627,31 @@ def get_global_pack_tables() -> GlobalPackTables | None:
     return _CACHED_GLOBAL_TABLES
 
 
+def _check_zone_thresholds(kwargs: dict, n_entity: dict[str, int]) -> None:
+    """The structured passes translate the thresholds in ZONE_THRESHOLDS from their zone where the zone is a fixed
+    region ("none" / "owned" / "all", see zone_region_below), not from the integer. Check that the integer passed
+    agrees with that meaning (one rank: "none" = 0, "owned" and "all" = every entity), so a multi-rank value or a
+    caller that passes something else fails loudly instead of selecting the wrong region."""
+    from gt4py.next.iterator.transforms.structured_backend_passes import (
+        ZONE_THRESHOLDS,
+        is_global_grid,
+        zone_region_below,
+    )
+
+    for name, (entity, kind, zone) in ZONE_THRESHOLDS.items():
+        if name not in kwargs or not isinstance(kwargs[name], (int, np.integer)) or entity not in n_entity:
+            continue
+        below = zone_region_below(kind, zone, is_global_grid())
+        if below is None:
+            continue
+        expected = 0 if below == "none" else n_entity[entity]
+        if int(kwargs[name]) != expected:
+            raise ValueError(
+                f"Structured zone thresholds: {name} = {int(kwargs[name])} (= {kind}({zone}) of {entity}) but the "
+                f"single-rank zone table expects {expected}. Multi-rank values are not covered."
+            )
+
+
 def _global_grid_mapping(tables: GlobalPackTables) -> tuple[IndexMap, StructuredRemapSizes]:
     """IndexMap view of the pack tables: ijk_to_edge / ij_to_vertex = gather, edge_to_ijk / vertex_to_ij = owned slot."""
     ni, nj, _ = tables.gather["e"].shape
@@ -1661,6 +1686,13 @@ class GenericStructuredWrapper:
             or 0
         )
         horizontal_start = int(hs_raw) if hs_raw is not None else 0
+
+        _n_entity = {}
+        if self.index_map is not None and getattr(self.index_map, "edge_to_ijk", None) is not None:
+            _n_entity["Edge"] = len(self.index_map.edge_to_ijk)
+        if self.cell_to_ijk is not None:
+            _n_entity["Cell"] = len(self.cell_to_ijk)
+        _check_zone_thresholds(kwargs, _n_entity)
 
         _all_threshold_params = _KNOWN_EDGE_THRESHOLD_PARAMS | _KNOWN_CELL_THRESHOLD_PARAMS
         extra_thresholds = tuple(sorted(

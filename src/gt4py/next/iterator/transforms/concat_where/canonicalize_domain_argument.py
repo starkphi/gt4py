@@ -74,6 +74,9 @@ class _CanonicalizeDomainArgument(
     def transform(self, node: itir.Node) -> Optional[itir.Node]:  # type: ignore[override] # ignore kwargs for simplicity
         if cpm.is_call_to(node, "concat_where"):
             cond_expr, field_a, field_b = node.args
+            # `concat_where(~d, a, b)` -> concat_where(d, b, a)
+            if cpm.is_call_to(cond_expr, "not_"):
+                return self.fp_transform(im.concat_where(cond_expr.args[0], field_b, field_a))
             # `concat_where(d1 & d2, a, b)` -> concat_where(d1, concat_where(d2, a, b), b)
             if cpm.is_call_to(cond_expr, "and_"):
                 conds = cond_expr.args

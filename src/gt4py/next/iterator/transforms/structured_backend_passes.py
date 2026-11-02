@@ -63,6 +63,51 @@ def _lateral_boundary_rings(rings: int) -> int:
     (GT4PY_GLOBAL_PACK_TABLES): no lateral boundary and no nudging zone there, every owned entity is interior."""
     return 0 if os.environ.get("GT4PY_GLOBAL_PACK_TABLES") else rings
 
+
+#: The ICON zone behind each index-threshold program parameter, as (entity, "start" | "end", h_grid.Zone name).
+#: Taken from where icon4py computes the value (solve_nonhydro.py, velocity_advection.py, diffusion.py:
+#: grid.start_index/end_index(domain(Zone.X))). Comparisons on these names are translated from the zone's meaning
+#: where that meaning is a fixed region (zone_region_below); real lateral-boundary / nudging rows keep the integer path.
+ZONE_THRESHOLDS: dict[str, tuple[str, str, str]] = {
+    "start_edge_lateral_boundary": ("Edge", "start", "LATERAL_BOUNDARY"),
+    "start_edge_lateral_boundary_level_7": ("Edge", "start", "LATERAL_BOUNDARY_LEVEL_7"),
+    "start_edge_nudging_level_2": ("Edge", "start", "NUDGING_LEVEL_2"),
+    "start_2nd_nudge_line_idx_e": ("Edge", "start", "NUDGING_LEVEL_2"),
+    "end_edge_nudging": ("Edge", "end", "NUDGING"),
+    "end_edge_local": ("Edge", "end", "LOCAL"),
+    "end_edge_halo": ("Edge", "end", "HALO"),
+    "interior_idx": ("Cell", "start", "INTERIOR"),
+    "halo_idx": ("Cell", "end", "LOCAL"),
+    "lateral_boundary_level_2": ("Cell", "start", "LATERAL_BOUNDARY_LEVEL_2"),
+}
+
+
+def is_global_grid() -> bool:
+    return bool(os.environ.get("GT4PY_GLOBAL_PACK_TABLES"))
+
+
+def zone_region_below(kind: str, zone: str, global_grid: bool) -> str | None:
+    """Single rank: the region of entities whose ICON index lies *below* start/end(zone): "none", "owned" or
+    "all" (global: owned + halo ring). None = the zone is a real band of rows (limited-area lateral boundary or
+    nudging), keep the integer-based translation.
+    ICON order: lateral boundary rows, nudging rows, interior, halo levels. Global grid: no lateral boundary and no
+    nudging, they are empty at index 0. Limited area on one rank: no halo, so "owned" = "all"."""
+    if global_grid:
+        if zone.startswith(("LATERAL_BOUNDARY", "NUDGING")):
+            return "none"
+        if zone in ("INTERIOR", "LOCAL"):
+            return "none" if kind == "start" else "owned"
+        if zone in ("HALO", "END"):
+            return "owned" if kind == "start" else "all"
+        return None
+    if kind == "start" and zone in ("LATERAL_BOUNDARY", "LOCAL"):
+        return "none"
+    if zone.startswith(("LATERAL_BOUNDARY", "NUDGING")) or zone == "INTERIOR" and kind == "start":
+        return None
+    if zone in ("INTERIOR", "LOCAL", "HALO", "END"):
+        return "all"
+    return None
+
 # =====================================================================
 # Module-level cache
 # =====================================================================
@@ -2142,6 +2187,44 @@ class ThresholdConditionRewriter(NodeTranslator):
             return None
         return interior_cond if is_positive else im.not_(interior_cond)
 
+    def _zone_condition(
+        self, entity: str, threshold_id: str, axis_side: str, op_name: str,
+        symbolic_domain_sizes: dict[str, Any], program_param_ids: set[str],
+    ) -> ir.Expr | None:
+        """Translate `start(Z) <= Entity` / `Entity < end(Z)` from the zone Z behind the parameter name
+        (ZONE_THRESHOLDS) instead of from the integer value. None = not covered, use the old path."""
+        if threshold_id not in ZONE_THRESHOLDS:
+            return None
+        zone_entity, kind, zone = ZONE_THRESHOLDS[threshold_id]
+        below = zone_region_below(kind, zone, is_global_grid())
+        if zone_entity != entity or below is None:
+            return None
+        # Only the canonical forms: `index >= t` (above the threshold) and `index < t` (below it).
+        if (axis_side, op_name) in {("lhs", "greater_equal"), ("rhs", "less_equal")}:
+            region = {"none": "all", "owned": "halo", "all": "none"}[below]
+        elif (axis_side, op_name) in {("lhs", "less"), ("rhs", "greater")}:
+            region = below
+        else:
+            return None
+
+        IDim = common.Dimension("IDim", kind=common.DimensionKind.HORIZONTAL)
+        JDim = common.Dimension("JDim", kind=common.DimensionKind.HORIZONTAL)
+
+        def _box(i_hi: int, j_hi: int) -> ir.Expr:
+            return im.and_(
+                im.call("cartesian_domain")(im.named_range(IDim, ir.OffsetLiteral(value=0), ir.OffsetLiteral(value=i_hi))),
+                im.call("cartesian_domain")(im.named_range(JDim, ir.OffsetLiteral(value=0), ir.OffsetLiteral(value=j_hi))),
+            )
+
+        if region == "all":
+            return _box(int(symbolic_domain_sizes["max_i"]), int(symbolic_domain_sizes["max_j"]))
+        if region == "none":
+            return _box(0, 0)
+        owned = self._structured_entity_condition(entity, program_param_ids, symbolic_domain_sizes)
+        if owned is None:
+            return None
+        return owned if region == "owned" else im.not_(owned)
+
     # ── visit_FunCall: detect entity and dispatch ─────────────────────────────
 
     @staticmethod
@@ -2200,6 +2283,12 @@ class ThresholdConditionRewriter(NodeTranslator):
                 threshold_id = str(threshold_expr.id) if isinstance(threshold_expr, ir.SymRef) else None
                 if threshold_id is None:
                     return new_node
+
+                zone_cond = self._zone_condition(
+                    entity_axis, threshold_id, axis_side, op_name, symbolic_domain_sizes, program_param_ids
+                )
+                if zone_cond is not None:
+                    return zone_cond
 
                 def _has_sym(expr: ir.Expr, sym: str) -> bool:
                     """Return True if expr contains a SymRef with id==sym (early-exit via `or`/`any`)."""
