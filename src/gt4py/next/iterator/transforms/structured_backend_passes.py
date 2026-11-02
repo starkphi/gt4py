@@ -2421,6 +2421,27 @@ class SymbolicSizeInliner(NodeTranslator):
 # Pass 6: NeighborReductionUnroller — General + edge-specialized kolor peeling
 # =====================================================================
 
+def _accumulate_reduce_elem(
+    red_op: ir.Expr, init: ir.Expr, acc_field: ir.Expr | None, elem_field: ir.Expr, domain: ir.Expr | None
+) -> ir.Expr:
+    """One step of an unrolled reduction: `op(acc, elem)`, or `op(init, elem)` for the first element.
+
+    The init is folded into the first element instead of being built as its own constant field: that
+    field needed a dummy (never read) field argument for its shape, which fusion carried into the consumer
+    as a dead stencil param; the final domain inference then left that argument without a domain, which
+    the DaCe lowering cannot handle. Same operations and types as `op(...op(init, e0)..., eN)`.
+    """
+    if acc_field is None:
+        return im.as_fieldop(
+            im.lambda_("__b")(im.call(copy.deepcopy(red_op))(copy.deepcopy(init), im.deref("__b"))),
+            domain,
+        )(elem_field)
+    return im.as_fieldop(
+        im.lambda_("__a", "__b")(im.call(copy.deepcopy(red_op))(im.deref("__a"), im.deref("__b"))),
+        domain,
+    )(acc_field, elem_field)
+
+
 @dataclasses.dataclass
 class NeighborReductionUnroller(NodeTranslator):
     """General: Unrolls reduce(op)(neighbors(conn, it), ...) into explicit Cartesian shifts.
@@ -2706,9 +2727,7 @@ class NeighborReductionUnroller(NodeTranslator):
             if isinstance(conn_expr, ir.OffsetLiteral) and isinstance(conn_expr.value, str):
                 conn = conn_expr.value
                 input_field = copy.deepcopy(list_expr.args[1])
-                acc_field = im.as_fieldop(
-                    im.lambda_("__acc_init")(im.deref("__acc_init")), domain,
-                )(im.as_fieldop(im.lambda_("__x")(copy.deepcopy(widened_init)), domain)(input_field))
+                acc_field: ir.Expr | None = None
                 for idx in range(conn_size):
                     key: tuple[ir.OffsetLiteral, ir.OffsetLiteral] = (
                         ir.OffsetLiteral(value=conn), ir.OffsetLiteral(value=idx),
@@ -2721,14 +2740,10 @@ class NeighborReductionUnroller(NodeTranslator):
                     elem_field = _make_lifted_deref_shift(
                         input_field, cast(tuple[ir.OffsetLiteral, ...], entry["shifts"]), domain
                     )
-                    acc_field = im.as_fieldop(
-                        im.lambda_("__a", "__b")(
-                            im.call(copy.deepcopy(red_op))(im.deref("__a"), im.deref("__b"))
-                        ),
-                        domain,
-                    )(acc_field, elem_field)
+                    acc_field = _accumulate_reduce_elem(red_op, widened_init, acc_field, elem_field, domain)
                 else:
-                    return acc_field
+                    if acc_field is not None:
+                        return acc_field
 
         # Fast-path: fieldop list via map_dict
         if cpm.is_applied_as_fieldop(list_expr):
@@ -2737,10 +2752,7 @@ class NeighborReductionUnroller(NodeTranslator):
                     return _extract_base_field(node.args[0])
                 return node
 
-            base_field = copy.deepcopy(_extract_base_field(list_expr))
-            acc_field = im.as_fieldop(
-                im.lambda_("__acc_init")(im.deref("__acc_init")), domain,
-            )(im.as_fieldop(im.lambda_("__x")(copy.deepcopy(widened_init)), domain)(base_field))
+            acc_field = None
             for idx in range(conn_size):
                 elem_field = NeighborReductionUnroller._eval_list_field_at_idx(
                     list_expr, idx, domain, neutral_element,
@@ -2748,14 +2760,10 @@ class NeighborReductionUnroller(NodeTranslator):
                 )
                 if elem_field is None:
                     break
-                acc_field = im.as_fieldop(
-                    im.lambda_("__a", "__b")(
-                        im.call(copy.deepcopy(red_op))(im.deref("__a"), im.deref("__b"))
-                    ),
-                    domain,
-                )(acc_field, elem_field)
+                acc_field = _accumulate_reduce_elem(red_op, widened_init, acc_field, elem_field, domain)
             else:
-                return acc_field
+                if acc_field is not None:
+                    return acc_field
 
             # Fallback: pointwise strategy via lambda bindings
             stencil = list_expr.fun.args[0]
