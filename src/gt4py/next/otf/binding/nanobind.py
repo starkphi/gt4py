@@ -291,7 +291,14 @@ def create_bindings(
                 BindingFunction(
                     exported_name=program_source.entry_point.name,
                     wrapper_name=wrapper_name,
-                    doc="",
+                    # Names of the neighbor-table parameters (gt_conn_<offset>), in binding order. The structured
+                    # fork binds only the connectivities a program uses; gtfn.extract_connectivity_args reads this
+                    # list from __doc__ to pass exactly those tables (instead of guessing from the build cache).
+                    doc="gt4py_connectivities: " + " ".join(
+                        param.name
+                        for param in program_source.entry_point.parameters
+                        if param.name.startswith("gt_conn_")
+                    ),
                     n_params=len(program_source.entry_point.parameters),
                 )
             ],

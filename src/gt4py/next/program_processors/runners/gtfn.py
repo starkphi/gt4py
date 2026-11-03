@@ -98,10 +98,14 @@ def extract_connectivity_args(
 ) -> list[tuple[core_defs.NDArrayObject, tuple[int, ...]]]:
     # Note: this function is on the hot path and needs to have minimal overhead.
     zero_origin = (0, 0)
-    required_connectivities: tuple[str, ...] = _extract_required_connectivity_names(inp)
     connectivities_by_name = {
         name.lower(): conn for name, conn in offset_provider.items() if hasattr(conn, "ndarray")
     }
+    exact = _connectivity_names_from_binding_doc(inp) if inp is not None else None
+    if exact is not None:
+        # The binding states exactly which tables it takes (possibly none): no guessing.
+        return [(connectivities_by_name[name].ndarray, zero_origin) for name in exact]
+    required_connectivities: tuple[str, ...] = _extract_required_connectivity_names(inp)
 
     if required_connectivities:
         selected_connectivities = [
@@ -140,6 +144,21 @@ def _extract_required_connectivity_names_from_doc(doc: str) -> tuple[str, ...]:
             seen.add(name)
             names.append(name)
     return tuple(names)
+
+
+_CONNECTIVITY_DOC_MARKER = "gt4py_connectivities:"
+
+
+def _connectivity_names_from_binding_doc(inp: stages.ExecutableProgram) -> tuple[str, ...] | None:
+    """Exact neighbor-table list written into the binding docstring by `nanobind.create_bindings`
+    (may be empty). None if the binding predates the marker."""
+    for candidate in (inp, *(getattr(inp, a, None) for a in ("func", "__wrapped__"))):
+        doc = getattr(candidate, "__doc__", None) or ""
+        i = doc.find(_CONNECTIVITY_DOC_MARKER)
+        if i >= 0:
+            line = doc[i + len(_CONNECTIVITY_DOC_MARKER) :].split("\n", 1)[0]
+            return _extract_required_connectivity_names_from_doc(line)
+    return None
 
 
 def _extract_required_connectivity_names(inp: stages.ExecutableProgram | None) -> tuple[str, ...]:
