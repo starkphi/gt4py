@@ -310,6 +310,11 @@ def pre_inline_scalar_params(
         "end_edge_nudging", "end_edge_halo", "horizontal_start_distance",
         "horizontal_end_distance", "lateral_boundary_level_2",
     })
+    # Every parameter the threshold rewriter translates from its ICON zone (e.g. interior_idx / halo_idx, which the
+    # driver passes as compile-time constants): substituting them would leave an untranslated `index(Cell)` comparison.
+    from gt4py.next.iterator.transforms.structured_backend_passes import ZONE_THRESHOLDS
+
+    _unsafe = _unsafe | frozenset(ZONE_THRESHOLDS)
 
     from gt4py.next.type_system import type_specifications as _ts
 
