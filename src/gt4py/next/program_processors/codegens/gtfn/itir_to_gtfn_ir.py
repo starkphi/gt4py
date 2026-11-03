@@ -155,6 +155,36 @@ def _collect_local_dimensions_from_types(
     return offset_definitions
 
 
+def _collect_param_dimensions(
+    params: Iterable[itir.Sym], grid_type: common.GridType
+) -> dict[str, TagDefinition]:
+    """Tags for the dimensions of all program parameters, used or not.
+
+    `_collect_offset_definitions` only declares offsets the IR still uses. A parameter whose uses were removed
+    (e.g. by dead-code elimination for one static-argument variant) still appears in the bindings with its
+    dimension tags (`generated::Cell_t`, `generated::V2C_t`), so they must be declared as well."""
+    defs: dict[str, TagDefinition] = {}
+
+    def add(type_spec: ts.TypeSpec | None) -> None:
+        if isinstance(type_spec, ts.TupleType):
+            for t in type_spec.types:
+                add(t)
+            return
+        if not isinstance(type_spec, ts.FieldType):
+            return
+        for dim in type_spec.dims:
+            if grid_type == common.GridType.UNSTRUCTURED and dim.kind == common.DimensionKind.HORIZONTAL:
+                defs[dim.value] = TagDefinition(name=Sym(id=dim.value), alias=_horizontal_dimension)
+            elif grid_type == common.GridType.UNSTRUCTURED and dim.kind == common.DimensionKind.VERTICAL:
+                defs[dim.value] = TagDefinition(name=Sym(id=dim.value), alias=_vertical_dimension)
+            else:
+                defs[dim.value] = TagDefinition(name=Sym(id=dim.value))
+
+    for param in params:
+        add(param.type)
+    return defs
+
+
 def _collect_offset_definitions(
     node: itir.Node,
     grid_type: common.GridType,
@@ -708,6 +738,7 @@ class GTFN_lowering(eve.NodeTranslator, eve.VisitorWithSymbolTableTrait):
         executions = self._merge_scans(executions)
         function_definitions = self.visit(node.function_definitions) + extracted_functions
         offset_definitions = {
+            **_collect_param_dimensions(node.params, self.grid_type),
             **_collect_dimensions_from_domain(node.body),
             **_collect_local_dimensions_from_types(node.params, node.declarations),
             **_collect_offset_definitions(node, self.grid_type, self.offset_provider_type),
