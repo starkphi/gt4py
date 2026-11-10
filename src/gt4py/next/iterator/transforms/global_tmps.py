@@ -119,6 +119,33 @@ def _is_as_fieldop_of_scan(expr: itir.Expr) -> bool:
     )
 
 
+def _restrict_branch_domain(branch: itir.Expr, if_domain: object) -> itir.Expr:
+    """Clip the domain of an `if_` branch to the domain of the `if_` itself.
+
+    Each branch becomes its own `SetAt`, whose domain is taken from the branch's `annex.domain`
+    (`_populate_and_homogenize_domains`), while a temporary holding the `if_` is allocated with the
+    `if_`'s domain. Normally both are equal. In the structured pipeline (domain inference keeps
+    existing domains, fusion rebuilds the IR) a branch can keep an older, larger domain, e.g.
+    `if rayleigh_type == KLEMP: tmp = w else: tmp = w` with w on K [0, nlev+1) but tmp allocated on
+    [0, nlev) → the branch wrote one level past the temporary (out-of-bounds write on GPU and CPU).
+    The intersection never writes outside the allocation and never computes more than the branch's
+    inputs were inferred for. Unchanged if the domains are equal (always in the unstructured pipeline).
+    """
+    branch_domain = getattr(branch.annex, "domain", None)
+    if (
+        not isinstance(if_domain, SymbolicDomain)
+        or not isinstance(branch_domain, SymbolicDomain)
+        or branch_domain == if_domain
+        or set(branch_domain.ranges) != set(if_domain.ranges)
+        or branch_domain.grid_type != if_domain.grid_type
+    ):
+        return branch
+    branch.annex.domain = domain_utils._reduce_domains(
+        branch_domain, if_domain, range_reduce_op=domain_utils._range_intersection
+    )
+    return branch
+
+
 def _transform_if(
     stmt: itir.Stmt,
     declarations: list[itir.Temporary],
@@ -126,6 +153,9 @@ def _transform_if(
 ) -> Optional[list[itir.Stmt]]:
     if isinstance(stmt, itir.SetAt) and cpm.is_call_to(stmt.expr, "if_"):
         cond, true_val, false_val = stmt.expr.args
+        if_domain = getattr(stmt.expr.annex, "domain", None)
+        true_val = _restrict_branch_domain(true_val, if_domain)
+        false_val = _restrict_branch_domain(false_val, if_domain)
         return [
             itir.IfStmt(
                 cond=cond,
