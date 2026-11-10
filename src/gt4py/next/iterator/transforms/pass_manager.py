@@ -496,8 +496,8 @@ def apply_common_transforms(
             inlined = fuse_as_fieldop.FuseAsFieldOp.apply(
                 inlined, uids=uids, offset_provider_type=offset_provider_type
             )
-        except Exception:
-            pass
+        except Exception as _e:  # a failure here silently disables all fusion -> report it
+            print(f"[WARNING FuseAsFieldOp failed, no fusion] {type(_e).__name__}: {_e}"[:400])
 
         # FuseAsFieldOp intersects as_fieldop domains which introduces nested maximum/minimum
         # expressions in the K bounds (e.g. maximum(maximum(X, Y), Y)). Run ConstantFolding

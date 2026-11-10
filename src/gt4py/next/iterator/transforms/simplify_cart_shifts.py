@@ -6,7 +6,6 @@
 # Please, refer to the LICENSE file in the root directory.
 # SPDX-License-Identifier: BSD-3-Clause
 
-import copy
 import dataclasses
 
 from gt4py.eve import NodeTranslator
@@ -16,13 +15,17 @@ from gt4py.next.iterator.ir_utils import common_pattern_matcher as cpm, ir_maker
 
 @dataclasses.dataclass
 class SimplifyCartesianShifts(NodeTranslator):
+    # Keep the inferred domains: FuseAsFieldOp (run right after this pass in the fusion loop) needs
+    # `annex.domain` on make_tuple field elements. Without it fusion raised and was skipped entirely.
+    PRESERVED_ANNEX_ATTRS = ("type", "domain")
+
     @classmethod
     def apply(cls, node: ir.Node) -> ir.Node:
         return cls().visit(node)
 
     def visit_FunCall(self, node: ir.FunCall, **kwargs) -> ir.Expr:
         # 1. Bottom-up traversal: visit children first
-        visited_node = copy.deepcopy(self.generic_visit(node, **kwargs))
+        visited_node = self.generic_visit(node, **kwargs)  # already a new node, no deepcopy needed
 
         if cpm.is_applied_shift(visited_node):
             shift_args = list(visited_node.fun.args)

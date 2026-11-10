@@ -196,6 +196,20 @@ def fuse_as_fieldop(
         new_stencil, opcount_preserving=_opcount_preserving, force_inline_lift_args=True
     )
     new_stencil = inline_lifts.InlineLifts().visit(new_stencil)
+    # InlineLifts turns `shift(...)(lift(f)(x))` into `lift(f)(shift(...)(x))`. In structured stencils
+    # (per-Kolor shifts in both branches of an `if`) that lift can end up as an argument of a lambda
+    # call that InlineLambdas has already passed. Left alone, the CSE below binds the lifted lambda to
+    # a `_cs_N` variable, nothing can inline `lift(_cs_N)` any more, and gtfn fails with
+    # "Symbols {SymbolRef('lift')} not found". Repeat both passes until no lift remains.
+    for _ in range(5):
+        if not any(
+            cpm.is_call_to(n, "lift") for n in new_stencil.pre_walk_values().if_isinstance(itir.FunCall)
+        ):
+            break
+        new_stencil = inline_lambdas.InlineLambdas.apply(
+            new_stencil, opcount_preserving=_opcount_preserving, force_inline_lift_args=True
+        )
+        new_stencil = inline_lifts.InlineLifts().visit(new_stencil)
 
     new_node = im.as_fieldop(new_stencil, domain)(*new_args.values())
     if enable_cse:
