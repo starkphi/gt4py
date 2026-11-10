@@ -41,6 +41,51 @@ from gt4py.next.iterator import ir
 # - It is cleared only after the blocking call returns, so no race condition exists.
 _CURRENT_COMPILE_SDS: dict | None = None
 
+# GT4PY_STRUCTURED_TIMING=1: accumulate per-program pack / compile-lookup / exec / unpack wall times and per-argument
+# pack/unpack times; the report is printed at interpreter exit (first call of each program excluded: it compiles).
+_TIMING = os.environ.get("GT4PY_STRUCTURED_TIMING", "0") == "1"
+_TIMES: dict = {}  # program -> {"calls", "pack", "lookup", "exec", "unpack"}
+_ARG_TIMES: dict = {}  # (program, arg, "pack"|"unpack", kind) -> [calls, seconds]
+
+
+def _report_timing() -> None:
+    if not _TIMES:
+        return
+    tot = {k: sum(t[k] for t in _TIMES.values()) for k in ("pack", "lookup", "exec", "unpack")}
+    print("===== structured wrapper timing (s, first call per program excluded) =====")
+    print(f"{'program':60s} {'calls':>6s} {'pack':>9s} {'lookup':>9s} {'exec':>9s} {'unpack':>9s}")
+    for name, t in sorted(_TIMES.items(), key=lambda kv: -(kv[1]["pack"] + kv[1]["exec"] + kv[1]["unpack"])):
+        print(f"{name[:60]:60s} {t['calls']:6d} {t['pack']:9.3f} {t['lookup']:9.3f} {t['exec']:9.3f} {t['unpack']:9.3f}")
+    print(f"{'TOTAL':60s} {'':6s} {tot['pack']:9.3f} {tot['lookup']:9.3f} {tot['exec']:9.3f} {tot['unpack']:9.3f}")
+    by_kind: dict = {}
+    for (_, _, what, kind), (_, s) in _ARG_TIMES.items():
+        by_kind[what, kind] = by_kind.get((what, kind), 0.0) + s
+    print("by argument kind:", {f"{w}/{k}": round(s, 3) for (w, k), s in sorted(by_kind.items())})
+    print("top 30 arguments:")
+    for (prog, arg, what, kind), (n, s) in sorted(_ARG_TIMES.items(), key=lambda kv: -kv[1][1])[:30]:
+        print(f"  {s:9.3f} s {n:6d}x  {what:6s} {kind:7s} {prog[:45]}.{arg}")
+
+
+def _arg_kind(field) -> str:
+    dims = getattr(getattr(field, "domain", None), "dims", None)
+    if not dims:
+        return "scalar"
+    if len(dims) > 1 and getattr(dims[1], "kind", None) == gtx.DimensionKind.LOCAL:
+        return "sparse"
+    return "dense"
+
+
+def _add_arg_time(prog: str, arg: str, what: str, field, seconds: float) -> None:
+    rec = _ARG_TIMES.setdefault((prog, arg, what, _arg_kind(field)), [0, 0.0])
+    rec[0] += 1
+    rec[1] += seconds
+
+
+if _TIMING:
+    import atexit
+
+    atexit.register(_report_timing)
+
 
 def get_compile_sds() -> dict | None:
     """Return the symbolic_domain_sizes currently being compiled, or None."""
@@ -755,6 +800,7 @@ class GenericStructuredWrapper:
         self.index_map = index_map
         self.allocator = allocator
         self.operator_name = getattr(operator, "id", None) or getattr(operator, "__name__", "")
+        self._timing_calls = 0
         self.debug_enabled = os.environ.get("GT4PY_STRUCTURED_DEBUG", "0") == "1"
         self.remap_sizes = remap_sizes
         self.max_i = int(self.remap_sizes.max_i)
@@ -856,7 +902,14 @@ class GenericStructuredWrapper:
         # Cache for (shift_i, shift_j) per horizontal_start value. Key: horizontal_start int.
         self._shift_cache: dict[int, tuple[int, int]] = {}
         from gt4py._core import definitions as core_defs
-        self._use_gpu = getattr(allocator, "device_type", core_defs.DeviceType.CPU) in (
+        # icon4py passes a backend: its device sits on __gt_allocator__.__gt_device_type__, not .device_type
+        # (without this a GPU backend compiled for CPU and segfaulted on cupy fields).
+        _device = getattr(allocator, "device_type", None)
+        if _device is None and hasattr(allocator, "__gt_allocator__"):
+            _device = allocator.__gt_allocator__.__gt_device_type__
+        if _device is None:
+            _device = getattr(allocator, "__gt_device_type__", core_defs.DeviceType.CPU)
+        self._use_gpu = _device in (
             core_defs.DeviceType.CUDA,
             core_defs.DeviceType.ROCM,
         )
@@ -1742,6 +1795,7 @@ class GenericStructuredWrapper:
         for arg_name, arg_val in kwargs.items():
             if arg_name == "offset_provider":
                 continue
+            _t_arg = time.perf_counter()
             if isinstance(arg_val, tuple):
                 packed_tuple = tuple(self._pack_argument(f, _pack_shift_i, _pack_shift_j, arg_name) for f in arg_val)
                 structured_kwargs[arg_name] = packed_tuple
@@ -1754,6 +1808,13 @@ class GenericStructuredWrapper:
                 structured_kwargs[arg_name] = packed_arg
                 if getattr(arg_val, "domain", None) is not None:
                     packed_fields.append((arg_val, packed_arg))
+            if _TIMING and self._timing_calls > 0:
+                _first = arg_val[0] if isinstance(arg_val, tuple) and arg_val else arg_val
+                _add_arg_time(self.operator_name, arg_name, "pack", _first, time.perf_counter() - _t_arg)
+        if _TIMING and self._use_gpu:
+            import cupy as _cp
+
+            _cp.cuda.runtime.deviceSynchronize()
         _pack_end = time.perf_counter()
         _pack_elapsed = _pack_end - _pack_start
 
@@ -1778,8 +1839,10 @@ class GenericStructuredWrapper:
         self._pending_baked_strides = baked_strides
         self._pending_baked_range_starts = baked_range_starts
 
+        _lookup_start = time.perf_counter()
         compiled = self._get_or_compile(horizontal_start, extra_thresholds, extra_scalars)
-        
+        _lookup_elapsed = time.perf_counter() - _lookup_start
+
         _exec_start = time.perf_counter()
 
         # Re-set the ContextVar so DaCe pool-thread compilation sees the correct
@@ -1816,6 +1879,10 @@ class GenericStructuredWrapper:
             else:
                 # Fallback for non-partial wrappers.
                 compiled(**structured_kwargs)
+            if _TIMING and self._use_gpu:
+                import cupy as _cp  # GPU launches are async: sync so exec is not billed to unpack
+
+                _cp.cuda.runtime.deviceSynchronize()
             _exec_end = time.perf_counter()
             _exec_elapsed = _exec_end - _exec_start
         finally:
@@ -1823,10 +1890,28 @@ class GenericStructuredWrapper:
                 _CURRENT_COMPILE_SDS = None
 
         _unpack_start = time.perf_counter()
-        for original_field, packed_field in packed_fields:
+        _arg_names = (
+            [n for n, v in kwargs.items() if n != "offset_provider" for f in (v if isinstance(v, tuple) else (v,))
+             if getattr(f, "domain", None) is not None]
+            if _TIMING else None
+        )
+        for _k, (original_field, packed_field) in enumerate(packed_fields):
+            _t_arg = time.perf_counter()
             self._unpack_to_buffer(packed_field, original_field)
+            if _TIMING and self._timing_calls > 0:
+                _add_arg_time(self.operator_name, _arg_names[_k], "unpack", original_field, time.perf_counter() - _t_arg)
         _unpack_end = time.perf_counter()
         _unpack_elapsed = _unpack_end - _unpack_start
+        if _TIMING:
+            if self._timing_calls > 0:
+                t = _TIMES.setdefault(
+                    self.operator_name, {"calls": 0, "pack": 0.0, "lookup": 0.0, "exec": 0.0, "unpack": 0.0})
+                t["calls"] += 1
+                t["pack"] += _pack_elapsed
+                t["lookup"] += _lookup_elapsed
+                t["exec"] += _exec_elapsed
+                t["unpack"] += _unpack_elapsed
+            self._timing_calls += 1
 
         # Print timing summary
         # print(f"[timing] {self.operator_name} pack={_pack_elapsed:.8f}s exec={_exec_elapsed:.8f}s unpack={_unpack_elapsed:.8f}s total={_pack_elapsed + _exec_elapsed + _unpack_elapsed:.8f}s")
