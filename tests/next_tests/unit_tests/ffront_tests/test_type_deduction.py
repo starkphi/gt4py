@@ -239,7 +239,7 @@ def test_concat_where_invalid_dtype():
 
     with pytest.raises(
         errors.DSLError,
-        match="Field arguments to 'concat_where' must be of same dtype, got 'float64' != 'int32'.",
+        match="Could not promote 'float64' and 'int32' to common type in call to 'concat_where'.",
     ):
         _ = FieldOperatorParser.apply_to_function(domain_comparison)
 
@@ -547,6 +547,29 @@ def test_as_offset_dtype():
 
     with pytest.raises(errors.DSLError, match=f"expected integer for offset field dtype"):
         _ = FieldOperatorParser.apply_to_function(as_offset_dtype)
+
+
+def test_as_offset_non_cartesian():
+    Vertex = Dimension("Vertex", kind=DimensionKind.HORIZONTAL)
+    Edge = Dimension("Edge", kind=DimensionKind.HORIZONTAL)
+    V2EDim = Dimension("V2EDim", kind=DimensionKind.LOCAL)
+    V2E = FieldOffset("V2E", source=Edge, target=(Vertex, V2EDim))
+
+    def as_offset_neighbor(a: Field[[Edge], float], b: Field[[Edge], int]):
+        return a(as_offset(V2E, b))
+
+    with pytest.raises(errors.DSLError, match="Cartesian"):
+        _ = FieldOperatorParser.apply_to_function(as_offset_neighbor)
+
+    IDim = Dimension("IDim")
+    JDim = Dimension("JDim")
+    IfromJ = FieldOffset("IfromJ", source=IDim, target=(JDim,))
+
+    def as_offset_cross_dim(a: Field[[IDim], float], b: Field[[IDim], int]):
+        return a(as_offset(IfromJ, b))
+
+    with pytest.raises(errors.DSLError, match="Cartesian"):
+        _ = FieldOperatorParser.apply_to_function(as_offset_cross_dim)
 
 
 vpfloat: TypeAlias = float32

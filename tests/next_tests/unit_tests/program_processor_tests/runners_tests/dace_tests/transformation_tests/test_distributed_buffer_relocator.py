@@ -8,10 +8,9 @@
 
 from __future__ import annotations
 
+import dace
 import pytest
 import numpy as np
-
-dace = pytest.importorskip("dace")
 
 from gt4py.next.program_processors.runners.dace import (
     transformations as gtx_transformations,
@@ -21,7 +20,7 @@ from . import util
 
 
 def _mk_distributed_buffer_sdfg() -> tuple[dace.SDFG, dace.SDFGState, dace.SDFGState]:
-    sdfg = dace.SDFG(gtx_transformations.utils.unique_name("distributed_buffer_sdfg"))
+    sdfg = dace.SDFG(util.unique_name("distributed_buffer_sdfg"))
 
     for name in ["a", "b", "tmp"]:
         sdfg.add_array(name, shape=(10, 10), dtype=dace.float64, transient=False)
@@ -84,9 +83,7 @@ def test_distributed_buffer_remover():
 
 
 def _make_distributed_buffer_global_memory_data_race_sdfg() -> tuple[dace.SDFG, dace.SDFGState]:
-    sdfg = dace.SDFG(
-        gtx_transformations.utils.unique_name("distributed_buffer_global_memory_data_race")
-    )
+    sdfg = dace.SDFG(util.unique_name("distributed_buffer_global_memory_data_race"))
     arr_names = ["a", "b", "t"]
     for name in arr_names:
         sdfg.add_array(
@@ -138,9 +135,7 @@ def test_distributed_buffer_global_memory_data_race():
 def _make_distributed_buffer_global_memory_data_race_sdfg2() -> tuple[
     dace.SDFG, dace.SDFGState, dace.SDFGState
 ]:
-    sdfg = dace.SDFG(
-        gtx_transformations.utils.unique_name("distributed_buffer_global_memory_data_race2_sdfg")
-    )
+    sdfg = dace.SDFG(util.unique_name("distributed_buffer_global_memory_data_race2_sdfg"))
     arr_names = ["a", "b", "t"]
     for name in arr_names:
         sdfg.add_array(
@@ -193,9 +188,7 @@ def test_distributed_buffer_global_memory_data_race2():
 
 
 def _make_distributed_buffer_global_memory_data_no_rance() -> tuple[dace.SDFG, dace.SDFGState]:
-    sdfg = dace.SDFG(
-        gtx_transformations.utils.unique_name("distributed_buffer_global_memory_data_no_rance_sdfg")
-    )
+    sdfg = dace.SDFG(util.unique_name("distributed_buffer_global_memory_data_no_rance_sdfg"))
     arr_names = ["a", "t"]
     for name in arr_names:
         sdfg.add_array(
@@ -241,11 +234,7 @@ def test_distributed_buffer_global_memory_data_no_rance():
 
 
 def _make_distributed_buffer_global_memory_data_no_rance2() -> tuple[dace.SDFG, dace.SDFGState]:
-    sdfg = dace.SDFG(
-        gtx_transformations.utils.unique_name(
-            "distributed_buffer_global_memory_data_no_rance2_sdfg"
-        )
-    )
+    sdfg = dace.SDFG(util.unique_name("distributed_buffer_global_memory_data_no_rance2_sdfg"))
     arr_names = ["a", "t"]
     for name in arr_names:
         sdfg.add_array(
@@ -301,9 +290,7 @@ def test_distributed_buffer_global_memory_data_no_rance2():
 def _make_distributed_buffer_non_sink_temporary_sdfg() -> tuple[
     dace.SDFG, dace.SDFGState, dace.SDFGState
 ]:
-    sdfg = dace.SDFG(
-        gtx_transformations.utils.unique_name("distributed_buffer_non_sink_temporary_sdfg")
-    )
+    sdfg = dace.SDFG(util.unique_name("distributed_buffer_non_sink_temporary_sdfg"))
     state = sdfg.add_state(is_start_block=True)
     wb_state = sdfg.add_state_after(state)
 
@@ -399,3 +386,62 @@ def test_distributed_buffer_conditional_block():
 
     res = gtx_transformations.gt_reduce_distributed_buffering(sdfg)
     assert res[sdfg]["DistributedBufferRelocator"][wb_state] == {"t"}
+
+
+def _make_distributed_buffer_definition_in_loop_sdfg() -> tuple[
+    dace.SDFG, dace.SDFGState, dace.SDFGState
+]:
+    """Creates an SDFG where the temporary is written inside a loop body.
+
+    The SDFG models what is generated for `scan` field operators: in iteration
+    `k` the loop writes element `k` of the temporary `t` and afterwards, in a
+    regular state, the fully written `t` is copied into the output `b`.
+    """
+    sdfg = dace.SDFG(util.unique_name("distributed_buffer_definition_in_loop_sdfg"))
+
+    for name in ["a", "b", "t"]:
+        sdfg.add_array(name=name, shape=(10,), dtype=dace.float64, transient=False)
+    sdfg.arrays["t"].transient = True
+    sdfg.add_symbol("k", dace.int32)
+
+    entry_state = sdfg.add_state(is_start_block=True)
+    loop_region = dace.sdfg.state.LoopRegion("loop", "k < 10", "k", "k = k + 1")
+    sdfg.add_node(loop_region)
+    sdfg.add_edge(entry_state, loop_region, dace.InterstateEdge(assignments={"k": 0}))
+
+    body_state = loop_region.add_state("loop_body", is_start_block=True)
+    scan_step = body_state.add_tasklet(
+        name="scan_step",
+        inputs={"__in"},
+        code="__out = __in + 1.0",
+        outputs={"__out"},
+    )
+    body_state.add_edge(body_state.add_access("a"), None, scan_step, "__in", dace.Memlet("a[k]"))
+    body_state.add_edge(scan_step, "__out", body_state.add_access("t"), None, dace.Memlet("t[k]"))
+
+    wb_state = sdfg.add_state_after(loop_region)
+    wb_state.add_nedge(wb_state.add_access("t"), wb_state.add_access("b"), dace.Memlet("t[0:10]"))
+
+    sdfg.validate()
+    return sdfg, body_state, wb_state
+
+
+def test_distributed_buffer_definition_in_loop():
+    """Tests that the write back is never moved into the body of a loop.
+
+    Relocating the write back into the loop would execute it in every iteration,
+    thus on data that the loop has only written partially, which is not only
+    useless, but also creates a data race.
+    """
+    sdfg, body_state, wb_state = _make_distributed_buffer_definition_in_loop_sdfg()
+    assert wb_state.number_of_nodes() == 2
+    assert not any(dnode.data == "b" for dnode in body_state.data_nodes())
+
+    res = gtx_transformations.gt_reduce_distributed_buffering(sdfg)
+
+    # The write back has to stay in the state after the loop; in particular no
+    #  write to `b` may be added inside the loop.
+    assert res is None or "DistributedBufferRelocator" not in res[sdfg]
+    assert wb_state.number_of_nodes() == 2
+    assert not any(dnode.data == "b" for dnode in body_state.data_nodes())
+    sdfg.validate()

@@ -8,11 +8,11 @@
 
 from __future__ import annotations
 
+import dace
 import pytest
 import copy
 import numpy as np
 
-dace = pytest.importorskip("dace")
 from dace.sdfg import nodes as dace_nodes
 
 from gt4py.next.program_processors.runners.dace import (
@@ -25,7 +25,7 @@ import dace
 
 
 def _make_simple_two_state_sdfg() -> tuple[dace.SDFG, dace.SDFGState, dace.SDFGState]:
-    sdfg = dace.SDFG(gtx_transformations.utils.unique_name("simple_linear_states"))
+    sdfg = dace.SDFG(util.unique_name("simple_linear_states"))
     state1 = sdfg.add_state(is_start_block=True)
     state2 = sdfg.add_state_after(state1)
 
@@ -71,7 +71,7 @@ def _make_simple_two_state_sdfg() -> tuple[dace.SDFG, dace.SDFGState, dace.SDFGS
 
 def _make_global_in_both_read_and_write() -> tuple[dace.SDFG, dace.SDFGState, dace.SDFGState]:
     """The first state contains a read to a global and the second contains a write to the global."""
-    sdfg = dace.SDFG(gtx_transformations.utils.unique_name("global_in_both_states_read_and_write"))
+    sdfg = dace.SDFG(util.unique_name("global_in_both_states_read_and_write"))
     state1 = sdfg.add_state(is_start_block=True)
     state2 = sdfg.add_state_after(state1)
 
@@ -106,7 +106,7 @@ def _make_global_in_both_read_and_write() -> tuple[dace.SDFG, dace.SDFGState, da
 
 def _make_global_both_state_read() -> tuple[dace.SDFG, dace.SDFGState, dace.SDFGState]:
     """In both states the same global is read."""
-    sdfg = dace.SDFG(gtx_transformations.utils.unique_name("global_read_in_the_same_state"))
+    sdfg = dace.SDFG(util.unique_name("global_read_in_the_same_state"))
     state1 = sdfg.add_state(is_start_block=True)
     state2 = sdfg.add_state_after(state1)
 
@@ -140,7 +140,7 @@ def _make_global_both_state_read() -> tuple[dace.SDFG, dace.SDFGState, dace.SDFG
 
 def _make_global_both_state_write() -> tuple[dace.SDFG, dace.SDFGState, dace.SDFGState]:
     """In both states the same global is written."""
-    sdfg = dace.SDFG(gtx_transformations.utils.unique_name("global_write_in_the_same_state"))
+    sdfg = dace.SDFG(util.unique_name("global_write_in_the_same_state"))
     state1 = sdfg.add_state(is_start_block=True)
     state2 = sdfg.add_state_after(state1)
 
@@ -176,9 +176,7 @@ def _make_empty_state(
     first_state_empty: bool,
 ) -> tuple[dace.SDFG, dace.SDFGState, dace.SDFGState]:
     sdfg = dace.SDFG(
-        gtx_transformations.utils.unique_name(
-            "global_" + ("first" if first_state_empty else "second") + "_state_empty"
-        )
+        util.unique_name("global_" + ("first" if first_state_empty else "second") + "_state_empty")
     )
     state1 = sdfg.add_state(is_start_block=True)
     state2 = sdfg.add_state_after(state1)
@@ -206,7 +204,7 @@ def _make_empty_state(
 
 def _make_global_merge_1() -> dace.SDFG:
     """The first state writes to a global while the second state reads and writes to it."""
-    sdfg = dace.SDFG(gtx_transformations.utils.unique_name("global_merge_1"))
+    sdfg = dace.SDFG(util.unique_name("global_merge_1"))
     state1 = sdfg.add_state(is_start_block=True)
     state2 = sdfg.add_state_after(state1)
 
@@ -239,7 +237,7 @@ def _make_global_merge_1() -> dace.SDFG:
 
 def _make_global_merge_2() -> dace.SDFG:
     """In both states the global data is read and written to."""
-    sdfg = dace.SDFG(gtx_transformations.utils.unique_name("global_merge_2"))
+    sdfg = dace.SDFG(util.unique_name("global_merge_2"))
     state1 = sdfg.add_state(is_start_block=True)
     state2 = sdfg.add_state_after(state1)
 
@@ -271,7 +269,7 @@ def _make_global_merge_2() -> dace.SDFG:
 
 def _make_swapping_sdfg() -> dace.SDFG:
     """Makes an SDFG that implements `x, y = y, x` with Memlets."""
-    sdfg = dace.SDFG(gtx_transformations.utils.unique_name("swapping_sdfg"))
+    sdfg = dace.SDFG(util.unique_name("swapping_sdfg"))
     state1 = sdfg.add_state(is_start_block=True)
     state2 = sdfg.add_state_after(state1)
 
@@ -301,7 +299,7 @@ def _make_swapping_sdfg() -> dace.SDFG:
 
 
 def _make_non_concurrent_sdfg() -> tuple[dace.SDFG, dace.SDFGState, dace.SDFGState]:
-    sdfg = dace.SDFG(gtx_transformations.utils.unique_name("non_concurrent_sdfg"))
+    sdfg = dace.SDFG(util.unique_name("non_concurrent_sdfg"))
     state1 = sdfg.add_state(is_start_block=True)
     state2 = sdfg.add_state_after(state1)
 
@@ -347,7 +345,7 @@ def _make_non_concurrent_sdfg() -> tuple[dace.SDFG, dace.SDFGState, dace.SDFGSta
 
 
 def _make_double_producer_sdfg() -> tuple[dace.SDFG, dace.SDFGState, dace.SDFGState]:
-    sdfg = dace.SDFG(gtx_transformations.utils.unique_name("double_producer_sdfg"))
+    sdfg = dace.SDFG(util.unique_name("double_producer_sdfg"))
     state1 = sdfg.add_state(is_start_block=True)
     state2 = sdfg.add_state_after(state1)
 
@@ -396,7 +394,7 @@ def _make_double_producer_sdfg() -> tuple[dace.SDFG, dace.SDFGState, dace.SDFGSt
 
 
 def _make_double_consumer_sdfg() -> tuple[dace.SDFG, dace.SDFGState, dace.SDFGState]:
-    sdfg = dace.SDFG(gtx_transformations.utils.unique_name("double_consumer_sdfg"))
+    sdfg = dace.SDFG(util.unique_name("double_consumer_sdfg"))
     state1 = sdfg.add_state(is_start_block=True)
     state2 = sdfg.add_state_after(state1)
 
@@ -470,7 +468,7 @@ def _make_double_consumer_sdfg() -> tuple[dace.SDFG, dace.SDFGState, dace.SDFGSt
 
 
 def _make_hidden_double_producer_sdfg() -> tuple[dace.SDFG, dace.SDFGState, dace.SDFGState]:
-    sdfg = dace.SDFG(gtx_transformations.utils.unique_name("hidden_double_producer_sdfg"))
+    sdfg = dace.SDFG(util.unique_name("hidden_double_producer_sdfg"))
     state1 = sdfg.add_state(is_start_block=True)
     state2 = sdfg.add_state_after(state1)
 
@@ -626,7 +624,7 @@ def test_empty_second_state():
 
 
 def test_both_states_are_empty():
-    sdfg = dace.SDFG(gtx_transformations.utils.unique_name("full_empty_sdfg"))
+    sdfg = dace.SDFG(util.unique_name("full_empty_sdfg"))
     state1 = sdfg.add_state(is_start_block=True)
     state2 = sdfg.add_state_after(state1)
     assert util.count_nodes(sdfg, dace_nodes.AccessNode) == 0
@@ -782,3 +780,106 @@ def test_hidden_double_producer():
     sdfg.validate()
 
     assert nb_applied == 0
+
+
+def _make_global_read_up_and_downstream_of_messenger() -> tuple[
+    dace.SDFG, dace.SDFGState, dace.SDFGState
+]:
+    """The second state writes a global that the first state also reads downstream of the messenger.
+
+    The first state reads the global `g` twice; once to produce the transient
+    messenger `t` (`t = g + 1`) and once together with the messenger
+    (`u = t / g`). Note that both computations share the same AccessNodes and
+    therefore form a single concurrent subgraph. The second state then performs
+    the write back `g = t`.
+
+    This models in-place update field operators of the form
+
+    ```python
+    z_g = g
+    g_new = g + incr
+    o = g_new / z_g
+    ```
+
+    where the second state performs the write back of `g_new` into `g`.
+    """
+    sdfg = dace.SDFG(util.unique_name("global_read_up_and_downstream_of_messenger"))
+    state1 = sdfg.add_state(is_start_block=True)
+    state2 = sdfg.add_state_after(state1)
+
+    for name in ["g", "t", "u"]:
+        sdfg.add_array(
+            name,
+            shape=(10,),
+            dtype=dace.float64,
+            transient=name in {"t", "u"},
+        )
+
+    # The AccessNodes are shared between the two computations, such that the
+    #  dataflow of the first state forms a single concurrent subgraph.
+    g = state1.add_access("g")
+    t = state1.add_access("t")
+
+    # Upstream computation: `t = g + 1`, `t` is the messenger.
+    state1.add_mapped_tasklet(
+        "comp1",
+        map_ranges={"__i": "0:10"},
+        inputs={"__in": dace.Memlet("g[__i]")},
+        code="__out = __in + 1.",
+        outputs={"__out": dace.Memlet("t[__i]")},
+        input_nodes={g},
+        output_nodes={t},
+        external_edges=True,
+    )
+    # Downstream computation: `u = t / g`, i.e. `g` is read a second time,
+    #  downstream of the messenger `t`.
+    state1.add_mapped_tasklet(
+        "comp2",
+        map_ranges={"__i": "0:10"},
+        inputs={
+            "__in1": dace.Memlet("t[__i]"),
+            "__in2": dace.Memlet("g[__i]"),
+        },
+        code="__out = __in1 / __in2",
+        outputs={"__out": dace.Memlet("u[__i]")},
+        input_nodes={t, g},
+        external_edges=True,
+    )
+
+    # Second state: write back `g = t`.
+    state2.add_nedge(
+        state2.add_access("t"),
+        state2.add_access("g"),
+        dace.Memlet("t[0:10] -> [0:10]"),
+    )
+
+    return sdfg, state1, state2
+
+
+def test_global_read_up_and_downstream_of_messenger():
+    """Fusing the states would create a WAR hazard on `g`, so it must not happen.
+
+    In the merged state the write `g = t` is dataflow-ordered after the
+    computation of the messenger `t`, and thus after the *first* read of `g`.
+    However, it is not ordered with respect to the *second* read of `g`: the
+    computation `u = t / g` depends on the messenger as well and is therefore
+    concurrent with the write back.
+    """
+    sdfg, state1, state2 = _make_global_read_up_and_downstream_of_messenger()
+    assert sdfg.number_of_nodes() == 2
+    # Both computations of the first state form a single concurrent subgraph.
+    assert len(dace.sdfg.utils.concurrent_subgraphs(state1)) == 1
+    assert util.count_nodes(state1, dace_nodes.AccessNode) == 3
+
+    nb_applied = sdfg.apply_transformations_repeated(gtx_transformations.GT4PyStateFusion)
+    sdfg.validate()
+
+    assert nb_applied == 0
+    assert sdfg.number_of_nodes() == 2
+
+    # Ensure that the unfused SDFG computes the intended result, i.e. the write
+    #  back `g = t` happened only after all reads of `g` in the first state.
+    g_orig = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0])
+    g = g_orig.copy()
+    sdfg(g=g)
+    assert np.allclose(g, g_orig + 1.0)

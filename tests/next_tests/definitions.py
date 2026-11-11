@@ -41,7 +41,6 @@ class _PythonObjectIdMixin:
 
 class ProgramBackendId(_PythonObjectIdMixin, str, enum.Enum):
     GTFN_CPU = "gt4py.next.program_processors.runners.gtfn.run_gtfn"
-    GTFN_CPU_IMPERATIVE = "gt4py.next.program_processors.runners.gtfn.run_gtfn_imperative"
     GTFN_CPU_NO_TRANSFORMS = "gt4py.next.program_processors.runners.gtfn.run_gtfn_no_transforms"
     GTFN_GPU = "gt4py.next.program_processors.runners.gtfn.run_gtfn_gpu"
     ROUNDTRIP = "gt4py.next.program_processors.runners.roundtrip.default"
@@ -101,6 +100,10 @@ USES_IR_IF_STMTS = "uses_ir_if_stmts"
 USES_INDEX_FIELDS = "uses_index_fields"
 USES_LIFT = "uses_lift"
 USES_NEGATIVE_MODULO = "uses_negative_modulo"
+USES_OFFSET_TAG_DIFFERING_FROM_LOCAL_DIM = "uses_offset_tag_differing_from_local_dim"
+USES_OFFSET_TAG_DIFFERING_FROM_LOCAL_DIM_IN_REDUCTION = (
+    "uses_offset_tag_differing_from_local_dim_in_reduction"
+)
 USES_ORIGIN = "uses_origin"
 USES_REDUCE_WITH_LAMBDA = "uses_reduce_with_lambda"
 USES_SCAN = "uses_scan"
@@ -108,7 +111,6 @@ USES_SCAN_IN_FIELD_OPERATOR = "uses_scan_in_field_operator"
 USES_SCAN_IN_STENCIL = "uses_scan_in_stencil"
 USES_SCAN_WITHOUT_FIELD_ARGS = "uses_scan_without_field_args"
 USES_SCAN_NESTED = "uses_scan_nested"
-USES_SCAN_REQUIRING_PROJECTOR = "uses_scan_requiring_projector"
 USES_SPARSE_FIELDS = "uses_sparse_fields"
 USES_SPARSE_FIELDS_AS_OUTPUT = "uses_sparse_fields_as_output"
 USES_REDUCTION_WITH_ONLY_SPARSE_FIELDS = "uses_reduction_with_only_sparse_fields"
@@ -127,6 +129,8 @@ USES_MESH_WITH_SKIP_VALUES = "uses_mesh_with_skip_values"
 USES_PROGRAM_METRICS = "uses_program_metrics"
 USES_SCALAR_IN_DOMAIN_AND_FO = "uses_scalar_in_domain_and_fo"
 USES_CONCAT_WHERE = "uses_concat_where"
+EMBEDDED_CONCAT_WHERE_INFINITE_DOMAIN = "embedded_concat_where_infinite_domain"
+EMBEDDED_CONCAT_WHERE_NON_CONTIGUOUS_DOMAIN = "embedded_concat_where_non_contiguous_domain"
 USES_PROGRAM_WITH_SLICED_OUT_ARGUMENTS = "uses_program_with_sliced_out_arguments"
 CHECKS_SPECIFIC_ERROR = "checks_specific_error"
 
@@ -136,6 +140,26 @@ BINDINGS_UNSUPPORTED_MESSAGE = "'{marker}' not supported by '{backend}' bindings
 REDUCTION_WITH_ONLY_SPARSE_FIELDS_MESSAGE = (
     "We cannot unroll a reduction on a sparse field only (not clear if it is legal ITIR)"
 )
+#: An offset and its local dimension must currently share a name on most backends, because
+#: the connectivity is looked up in the offset provider by the *local dimension's* name.
+#: Lifted for the gtfn shift path by #1789; see
+#: `regression_tests/ffront_tests/test_offset_dimensions_names.py`.
+OFFSET_TAG_DIFFERING_FROM_LOCAL_DIM_MESSAGE = (
+    "'{marker}': '{backend}' looks the connectivity up by the local dimension's name,"
+    " so it must equal the offset tag"
+)
+# Index-only vs. consequential markers:
+# A `uses_*` marker only affects execution if it appears in one of the skip lists below (and thus
+# in `BACKEND_SKIP_TEST_MATRIX`); such a marker is "consequential" -- it applies the listed
+# SKIP/XFAIL on the matching backends. A marker referenced nowhere here is "index-only": it has no
+# runtime effect and is purely a queryable feature tag (`pytest -m uses_<feature>`), hence always
+# safe to add. Because `xfail_strict` is enabled, adding a consequential marker to a test that
+# currently PASSES on a listed backend turns it into an unexpected pass (xpass) and FAILS -- so add
+# a consequential marker only once the test genuinely fails on that backend, and validate per-backend.
+# `uses_dace` is the one exception to "index-only is safe to add": it selects the nox test matrix
+# (`-m "uses_dace"` vs `-m "not uses_dace"` in `noxfile.py`), so tagging a test with it *removes*
+# that test from every `internal` session, and untagging removes it from the `dace` ones.
+
 # Common list of feature markers to skip
 COMMON_SKIP_TEST_LIST = [
     (USES_APPLIED_SHIFTS, XFAIL, UNSUPPORTED_MESSAGE),
@@ -159,17 +183,32 @@ DACE_SKIP_TEST_LIST = (
         (USES_SCAN_IN_STENCIL, XFAIL, BINDINGS_UNSUPPORTED_MESSAGE),
         (USES_SPARSE_FIELDS, XFAIL, UNSUPPORTED_MESSAGE),
         (USES_TUPLE_ITERATOR, XFAIL, UNSUPPORTED_MESSAGE),
+        (
+            USES_OFFSET_TAG_DIFFERING_FROM_LOCAL_DIM,
+            XFAIL,
+            OFFSET_TAG_DIFFERING_FROM_LOCAL_DIM_MESSAGE,
+        ),
+        (
+            USES_OFFSET_TAG_DIFFERING_FROM_LOCAL_DIM_IN_REDUCTION,
+            XFAIL,
+            OFFSET_TAG_DIFFERING_FROM_LOCAL_DIM_MESSAGE,
+        ),
     ]
 )
 EMBEDDED_SKIP_LIST = [
-    (USES_DYNAMIC_OFFSETS, XFAIL, UNSUPPORTED_MESSAGE),
     (CHECKS_SPECIFIC_ERROR, XFAIL, UNSUPPORTED_MESSAGE),
     (
         USES_SCAN_WITHOUT_FIELD_ARGS,
         XFAIL,
         UNSUPPORTED_MESSAGE,
     ),  # we can't extract the field type from scan args
-    (USES_CONCAT_WHERE, XFAIL, UNSUPPORTED_MESSAGE),
+    (EMBEDDED_CONCAT_WHERE_INFINITE_DOMAIN, XFAIL, UNSUPPORTED_MESSAGE),
+    (EMBEDDED_CONCAT_WHERE_NON_CONTIGUOUS_DOMAIN, XFAIL, UNSUPPORTED_MESSAGE),
+    (
+        USES_OFFSET_TAG_DIFFERING_FROM_LOCAL_DIM_IN_REDUCTION,
+        XFAIL,
+        OFFSET_TAG_DIFFERING_FROM_LOCAL_DIM_MESSAGE,
+    ),
 ]
 JAX_EMBEDDED_SKIP_LIST = EMBEDDED_SKIP_LIST + [
     (USES_PROGRAM_WITH_SLICED_OUT_ARGUMENTS, XFAIL, UNSUPPORTED_MESSAGE),
@@ -181,7 +220,13 @@ ROUNDTRIP_SKIP_LIST = DOMAIN_INFERENCE_SKIP_LIST + [
     (USES_CONCAT_WHERE, XFAIL, UNSUPPORTED_MESSAGE),
 ]
 GTIR_EMBEDDED_SKIP_LIST = ROUNDTRIP_SKIP_LIST + [
-    (USES_CONCAT_WHERE, XFAIL, UNSUPPORTED_MESSAGE),
+    # NOTE: not in `ROUNDTRIP_SKIP_LIST`: the roundtrip backend passes this, only the
+    # lower-level `iterator/embedded.py` execution keys on the local dimension's name.
+    (
+        USES_OFFSET_TAG_DIFFERING_FROM_LOCAL_DIM_IN_REDUCTION,
+        XFAIL,
+        OFFSET_TAG_DIFFERING_FROM_LOCAL_DIM_MESSAGE,
+    ),
 ]
 GTFN_SKIP_TEST_LIST = (
     COMMON_SKIP_TEST_LIST
@@ -193,6 +238,12 @@ GTFN_SKIP_TEST_LIST = (
         (USES_STRIDED_NEIGHBOR_OFFSET, XFAIL, BINDINGS_UNSUPPORTED_MESSAGE),
         # max_over broken, see https://github.com/GridTools/gt4py/issues/1289
         (USES_MAX_OVER, XFAIL, UNSUPPORTED_MESSAGE),
+        # NOTE: only the reduction; #1789 lifted this for the shift path.
+        (
+            USES_OFFSET_TAG_DIFFERING_FROM_LOCAL_DIM_IN_REDUCTION,
+            XFAIL,
+            OFFSET_TAG_DIFFERING_FROM_LOCAL_DIM_MESSAGE,
+        ),
     ]
 )
 
@@ -208,8 +259,6 @@ BACKEND_SKIP_TEST_MATRIX = {
     OptionalProgramBackendId.DACE_CPU_GT: DACE_SKIP_TEST_LIST,
     OptionalProgramBackendId.DACE_CPU_GT_NO_OPT: DACE_SKIP_TEST_LIST,
     ProgramBackendId.GTFN_CPU: GTFN_SKIP_TEST_LIST
-    + [(USES_SCAN_NESTED, XFAIL, UNSUPPORTED_MESSAGE)],
-    ProgramBackendId.GTFN_CPU_IMPERATIVE: GTFN_SKIP_TEST_LIST
     + [(USES_SCAN_NESTED, XFAIL, UNSUPPORTED_MESSAGE)],
     ProgramBackendId.GTFN_GPU: GTFN_SKIP_TEST_LIST
     + [(USES_SCAN_NESTED, XFAIL, UNSUPPORTED_MESSAGE)],

@@ -6,22 +6,24 @@
 # Please, refer to the LICENSE file in the root directory.
 # SPDX-License-Identifier: BSD-3-Clause
 
+import dataclasses
 import functools
 import re
 from typing import Any
+import pathlib
+from collections.abc import Callable
+from typing import TypeAlias
 
-import factory
 import numpy as np
 
 import gt4py._core.definitions as core_defs
-import gt4py.next.custom_layout_allocators as next_allocators
-from gt4py._core import filecache
-from gt4py.next import backend, common, config, field_utils
+from gt4py.next import backend, common, field_utils
 from gt4py.next.embedded import nd_array_field
 from gt4py.next.instrumentation import metrics
-from gt4py.next.otf import recipes, stages, workflow
+from gt4py.next.iterator import ir as itir
+from gt4py.next.otf import artifacts, recipes, stages, workflow
 from gt4py.next.otf.binding import nanobind
-from gt4py.next.otf.compilation import compiler
+from gt4py.next.otf.compilation import cache, compiler
 from gt4py.next.otf.compilation.build_systems import compiledb
 from gt4py.next.program_processors.codegens.gtfn import gtfn_module
 
@@ -47,11 +49,11 @@ def convert_arg(arg: Any) -> Any:
 
 
 def convert_args(
-    inp: stages.ExecutableProgram, device: core_defs.DeviceType = core_defs.DeviceType.CPU
-) -> stages.ExecutableProgram:
+    inp: artifacts.ExecutableProgram, device: core_defs.DeviceType = core_defs.DeviceType.CPU
+) -> artifacts.ExecutableProgram:
     def decorated_program(
         *args: Any,
-        offset_provider: dict[str, common.Connectivity | common.Dimension],
+        offset_provider: dict[str, common.OffsetProviderElem],
         out: Any = None,
     ) -> None:
         # Note: this function is on the hot path and needs to have minimal overhead.
@@ -126,7 +128,6 @@ def extract_connectivity_args(
         common.is_neighbor_table(conn) and field_utils.verify_device_field_type(conn, device)
         for conn in selected_connectivities
     )
-
     args: list[tuple[core_defs.NDArrayObject, tuple[int, ...]]] = [
         (conn.ndarray, zero_origin) for conn in selected_connectivities
     ]
@@ -236,98 +237,222 @@ def _extract_required_connectivity_names_from_cache(function_name: str) -> tuple
     return ()
 
 
-class GTFNCompileWorkflowFactory(factory.Factory):
-    class Meta:
-        model = recipes.OTFCompileWorkflow
+@dataclasses.dataclass(frozen=True)
+class GTFNCompilationArtifact(compiler.CPPCompilationArtifact):
+    def load(self) -> artifacts.ExecutableProgram:
+        return convert_args(super().load(), device=self.device_type)
 
-    class Params:
-        device_type: core_defs.DeviceType = core_defs.DeviceType.CPU
-        cmake_build_type: config.CMakeBuildType = factory.LazyFunction(  # type: ignore[assignment] # factory-boy typing not precise enough
-            lambda: config.CMAKE_BUILD_TYPE
-        )
-        builder_factory: compiler.BuildSystemProjectGenerator = factory.LazyAttribute(  # type: ignore[assignment] # factory-boy typing not precise enough
-            lambda o: compiledb.CompiledbFactory(cmake_build_type=o.cmake_build_type)
-        )
 
-        cached_translation = factory.Trait(
-            translation=factory.LazyAttribute(
-                lambda o: workflow.CachedStep(
-                    o.bare_translation,
-                    hash_function=stages.fingerprint_compilable_program,
-                    cache=filecache.FileCache(str(config.BUILD_CACHE_DIR / "gtfn_cache")),
-                )
-            ),
+@dataclasses.dataclass(frozen=True)
+class GTFNCompiler(compiler.CPPCompiler):
+    def _make_artifact(
+        self, src_dir: pathlib.Path, module: pathlib.Path, entry_point_name: str
+    ) -> GTFNCompilationArtifact:
+        return GTFNCompilationArtifact(
+            src_dir=src_dir,
+            module=module,
+            entry_point_name=entry_point_name,
+            device_type=self.device_type,
         )
 
-        bare_translation = factory.SubFactory(
-            gtfn_module.GTFNTranslationStepFactory,
-            device_type=factory.SelfAttribute("..device_type"),
-        )
 
-    translation = factory.LazyAttribute(lambda o: o.bare_translation)
-
-    bindings: workflow.Workflow[stages.ProgramSource, stages.CompilableProject] = (
-        nanobind.bind_source
-    )
-    compilation = factory.SubFactory(
-        compiler.CompilerFactory,
-        cache_lifetime=factory.LazyFunction(lambda: config.BUILD_CACHE_LIFETIME),
-        builder_factory=factory.SelfAttribute("..builder_factory"),
-    )
-    decoration = factory.LazyAttribute(
-        lambda o: functools.partial(convert_args, device=o.device_type)
-    )
+@dataclasses.dataclass(frozen=True)
+class GTFNConfig(backend.ToolchainConfig):
+    """Settings shared by the steps of a GTFN toolchain, see `ToolchainConfig`."""
 
 
-class GTFNBackendFactory(factory.Factory):
-    class Meta:
-        model = backend.Backend
+#: Step builders: callables creating a step from the toolchain configuration.
+GTFNTranslationBuilder: TypeAlias = Callable[[GTFNConfig], stages.TranslationStep]
+GTFNBindingsBuilder: TypeAlias = Callable[
+    [GTFNConfig], workflow.Workflow[artifacts.ProgramSource, artifacts.ExtensionSource]
+]
+GTFNCompilationBuilder: TypeAlias = Callable[
+    [GTFNConfig], workflow.Workflow[artifacts.ExtensionSource, artifacts.CompilationArtifact]
+]
 
-    class Params:
-        name_device = "cpu"
-        name_cached = ""
-        name_temps = ""
-        name_postfix = ""
-        gpu = factory.Trait(
-            allocator=next_allocators.StandardGPUFieldBufferAllocator(),
-            device_type=core_defs.CUPY_DEVICE_TYPE or core_defs.DeviceType.CUDA,
-            name_device="gpu",
-        )
-        cached = factory.Trait(
-            executor=factory.LazyAttribute(
-                lambda o: workflow.CachedStep(o.otf_workflow, hash_function=o.hash_function)
-            ),
-            name_cached="_cached",
-        )
-        device_type = core_defs.DeviceType.CPU
-        hash_function = stages.compilation_hash
-        otf_workflow = factory.SubFactory(
-            GTFNCompileWorkflowFactory, device_type=factory.SelfAttribute("..device_type")
-        )
 
-    name = factory.LazyAttribute(
-        lambda o: f"run_gtfn_{o.name_device}{o.name_temps}{o.name_cached}{o.name_postfix}"
+def make_gtfn_translation(
+    cfg: GTFNConfig,
+    /,
+    *,
+    enable_itir_transforms: bool = True,
+    symbolic_domain_sizes: dict[str, itir.Expr] | None = None,
+    use_max_domain_range_on_unstructured_shift: bool | None = None,
+) -> gtfn_module.GTFNTranslationStep:
+    """
+    Build the GTIR -> C++ translation step.
+
+    Args:
+        cfg: The toolchain configuration.
+        enable_itir_transforms: Run the GTIR transformation passes before code
+            generation.
+        symbolic_domain_sizes: Symbolic sizes of the domains, by dimension name.
+        use_max_domain_range_on_unstructured_shift: See `GTFNTranslationStep`.
+
+    Returns:
+        The translation step, targeting `cfg.device_type`.
+    """
+    return gtfn_module.GTFNTranslationStep(
+        device_type=cfg.device_type,
+        enable_itir_transforms=enable_itir_transforms,
+        symbolic_domain_sizes=symbolic_domain_sizes,
+        use_max_domain_range_on_unstructured_shift=use_max_domain_range_on_unstructured_shift,
     )
 
-    executor = factory.LazyAttribute(lambda o: o.otf_workflow)
-    allocator = next_allocators.StandardCPUFieldBufferAllocator()
-    transforms = backend.DEFAULT_TRANSFORMS
+
+def make_gtfn_bindings(
+    cfg: GTFNConfig, /
+) -> workflow.Workflow[artifacts.ProgramSource, artifacts.ExtensionSource]:
+    """Build the step generating the nanobind bindings of the translated program."""
+    # `OTFCompileWorkflow` is not parameterized over the code spec, so its
+    # `bindings` field is typed for `ProgramSource[Any]` while
+    # `ExtensionGenerator` accepts only C++-like specs. Parameterizing the
+    # pipeline is the real fix and belongs with the pipeline rework.
+    return nanobind.ExtensionGenerator(  # type: ignore[return-value] # see comment above
+        unstructured_horizontal_has_unit_stride=cfg.unstructured_horizontal_has_unit_stride
+    )
 
 
-run_gtfn = GTFNBackendFactory()
+def make_gtfn_build_system(
+    cfg: GTFNConfig,
+    /,
+    *,
+    cmake_extra_flags: list[str] | None = None,
+    renew_compiledb: bool = False,
+) -> compiledb.CompiledbFactory:
+    """
+    Build the build-system project generator used by the GTFN compiler.
 
-run_gtfn_imperative = GTFNBackendFactory(
-    name_postfix="_imperative", otf_workflow__translation__use_imperative_backend=True
-)
+    Args:
+        cfg: The toolchain configuration.
+        cmake_extra_flags: Extra flags passed to CMake.
+        renew_compiledb: Regenerate the compilation database even if one exists.
 
-run_gtfn_cached = GTFNBackendFactory(cached=True, otf_workflow__cached_translation=True)
+    Returns:
+        A `CompiledbFactory` using `cfg.cmake_build_type`.
+    """
+    return compiledb.CompiledbFactory(
+        cmake_build_type=cfg.cmake_build_type,
+        cmake_extra_flags=cmake_extra_flags or [],
+        renew_compiledb=renew_compiledb,
+    )
 
-run_gtfn_gpu = GTFNBackendFactory(gpu=True)
 
-run_gtfn_gpu_cached = GTFNBackendFactory(
-    gpu=True, cached=True, otf_workflow__cached_translation=True
-)
+def make_gtfn_compiler(
+    cfg: GTFNConfig,
+    /,
+    *,
+    build_system: Callable[[GTFNConfig], compiler.BuildSystemProjectGenerator] = (
+        make_gtfn_build_system
+    ),
+    force_recompile: bool = False,
+) -> GTFNCompiler:
+    """
+    Build the compilation step.
 
-run_gtfn_no_transforms = GTFNBackendFactory(
-    otf_workflow__bare_translation__enable_itir_transforms=False
+    Args:
+        cfg: The toolchain configuration.
+        build_system: Builder of the build-system project generator.
+        force_recompile: Recompile even if a cached build exists.
+
+    Returns:
+        The compilation step, targeting `cfg.device_type`.
+    """
+    return GTFNCompiler(
+        cache_lifetime=cfg.cache_lifetime,
+        builder_factory=build_system(cfg),
+        device_type=cfg.device_type,
+        force_recompile=force_recompile,
+    )
+
+
+def make_gtfn_compile_workflow(
+    cfg: GTFNConfig | None = None,
+    /,
+    *,
+    translation: GTFNTranslationBuilder = make_gtfn_translation,
+    bindings: GTFNBindingsBuilder = make_gtfn_bindings,
+    compilation: GTFNCompilationBuilder = make_gtfn_compiler,
+) -> recipes.OTFCompileWorkflow:
+    """
+    Build the GTFN translation -> bindings -> compilation workflow.
+
+    Every step is created by a step builder that receives `cfg`, so all steps
+    agree on the settings in it. To customize a step, pass a different
+    builder: a `functools.partial` of the default one to change a
+    step-local setting, e.g.
+    `translation=functools.partial(make_gtfn_translation, enable_itir_transforms=False)`,
+    or any callable taking the config to replace the step. The translation
+    step is wrapped in the cache here, after its builder ran, so a custom
+    translation step is cached like the default one. A custom step builder is
+    responsible for configuring its step from `cfg`.
+
+    Args:
+        cfg: The toolchain configuration. Defaults to `GTFNConfig()`.
+        translation: Builder of the translation step.
+        bindings: Builder of the bindings step.
+        compilation: Builder of the compilation step.
+
+    Returns:
+        The composed compile workflow.
+    """
+    if cfg is None:
+        cfg = GTFNConfig()
+
+    translation_step = translation(cfg)
+    compilation_step = compilation(cfg)
+
+    if cfg.cached_translation:
+        translation_step = cache.persistent_translation_cache(
+            translation_step, "gtfn", cfg.cache_lifetime
+        )
+
+    return recipes.OTFCompileWorkflow(
+        translation=translation_step, bindings=bindings(cfg), compilation=compilation_step
+    )
+
+
+def make_gtfn_toolchain(
+    cfg: GTFNConfig | None = None,
+    /,
+    *,
+    name_postfix: str = "",
+    translation: GTFNTranslationBuilder = make_gtfn_translation,
+    bindings: GTFNBindingsBuilder = make_gtfn_bindings,
+    compilation: GTFNCompilationBuilder = make_gtfn_compiler,
+) -> backend.Backend:
+    """
+    Build a GTFN toolchain.
+
+    Args:
+        cfg: The toolchain configuration. Defaults to `GTFNConfig()`.
+        name_postfix: Appended to the toolchain name, which must stay unique.
+        translation: Builder of the translation step, see
+            `make_gtfn_compile_workflow`.
+        bindings: Builder of the bindings step.
+        compilation: Builder of the compilation step.
+
+    Returns:
+        The configured toolchain.
+    """
+    if cfg is None:
+        cfg = GTFNConfig()
+
+    return backend.Backend(
+        name=f"run_gtfn_{cfg.device_name}{name_postfix}",
+        executor=make_gtfn_compile_workflow(
+            cfg, translation=translation, bindings=bindings, compilation=compilation
+        ),
+        allocator=cfg.make_allocator(),
+        transforms=backend.DEFAULT_TRANSFORMS,
+    )
+
+
+run_gtfn = make_gtfn_toolchain()
+
+run_gtfn_gpu = make_gtfn_toolchain(GTFNConfig(gpu=True))
+
+run_gtfn_no_transforms = make_gtfn_toolchain(
+    name_postfix="_no_transforms",
+    translation=functools.partial(make_gtfn_translation, enable_itir_transforms=False),
 )

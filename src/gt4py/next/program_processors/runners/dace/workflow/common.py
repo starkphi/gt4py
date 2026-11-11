@@ -8,24 +8,41 @@
 
 import contextlib
 import os
-from typing import Any, Final, Generator, Optional
+from typing import Any, Final, Generator, Optional, TypeAlias
 
 import dace
 
 from gt4py._core import definitions as core_defs
+from gt4py.eve import xtyping
 from gt4py.next import config as gtx_config
+from gt4py.next.otf.compilation import common as gtx_compilation_common
 
 
 SDFG_ARG_METRIC_LEVEL: Final[str] = "gt_metrics_level"
 """Name of SDFG argument to input the GT4Py metrics level."""
 
 
+SDFG_ARG_METRIC_LEVEL_DTYPE: Final[dace.dtypes.typeclass] = dace.int32
+"""DaCe datatype of `SDFG_ARG_METRIC_LEVEL` argument."""
+
+
 SDFG_ARG_METRIC_COMPUTE_TIME: Final[str] = "gt_compute_time"
 """Name of SDFG argument to return the total compute time to GT4Py."""
 
 
-SDFG_ARG_METRIC_COPY_TIME: Final[str] = "gt_copy_time"
-"""Name of SDFG argument to accumulate copy-kernel wall time (subtract from compute time)."""
+SDFG_ARG_METRIC_COMPUTE_TIME_DTYPE: Final[dace.dtypes.typeclass] = dace.float64
+"""DaCe datatype of `SDFG_ARG_METRIC_COMPUTE_TIME` argument."""
+
+
+ExternalWorkspace: TypeAlias = dict[
+    core_defs.DeviceType, xtyping.ArrayInterface | xtyping.CUDAArrayInterface
+]
+""" Mapping from device types to array-like objects.
+
+    The array-like objects must be accepted by `dace.dtypes.array_interface_ptr()`
+    as a workspace: a host array exposing `gt4py.eve.xtyping.ArrayInterface`
+    or a device array exposing `gt4py.eve.xtyping.CUDAArrayInterface`.
+"""
 
 
 def set_dace_config(
@@ -65,6 +82,11 @@ def set_dace_config(
     #   cache the generated code and binary objects for the program SDFG, without
     #   creating any further sub-folder to compile the SDFG.
     dace.Config.set("cache", value="single")
+
+    # Disable detection of the CUDA architecture in DaCe, and instead use the one provided by GT4Py.
+    if device_arch := gtx_compilation_common.get_device_arch():
+        dace.Config.set("compiler.cuda.cuda_arch", value=device_arch)
+        dace.Config.set("compiler.cuda.hip_arch", value=device_arch)
 
     # Prevents the implicit change of Memlets to Maps. Instead they should be handled by
     #  `gt4py.next.program_processors.runners.dace.transfromations.gpu_utils.gt_gpu_transform_non_standard_memlet()`.
@@ -139,13 +161,23 @@ def set_dace_config(
         "progress", value=gtx_config.env_flag_to_bool("DACE_progress", default=gtx_config.DEBUG)
     )
 
-    # In debug mode use `development` otherwise use `production`.
-    # NOTE: In case you want to run with optimizations, but would like to have the full
-    #   DaCe folder, i.e. `development` mode, then export `DACE_compiler_build_folder_mode`
-    #   set to `development` (small case matters).
+    # Production-mode will only keep the compiled library and SDFG JSON-file.
     dace.Config.set(
-        "compiler", "build_folder_mode", value=("development" if gtx_config.DEBUG else "production")
+        "compiler.build_folder_mode",
+        value=("development" if gtx_config.KEEP_DACE_BUILD_FILES else "production"),
     )
+
+    # Do not lift implicit copies to `CopyLibraryNode` instances during code generation.
+    #  The lowering and the transformations of the conditional expressions (`if_`) that
+    #  GT4Py performs produce direct array-to-array copy edges, inside the branch states
+    #  of nested SDFGs, that memlet propagation marks as dynamic. The `CopyLibraryNode`
+    #  that the pass inserts for such an edge is expanded into a tasklet, whose dynamic
+    #  output write is then silently dropped by the CPU code generator (the write is
+    #  supposed to be emitted inline in the tasklet body, but the corresponding code
+    #  path calls `TargetCodeGenerator.ptr()` with an outdated signature, raising a
+    #  `TypeError` that is swallowed). Keeping the copies implicit makes the code
+    #  generator handle them through the array copy path instead, which is correct.
+    dace.Config.set("compiler.cpu.explicit_copy", value=False)
 
     # We are not interested in storing the history of SDFG transformations.
     dace.Config.set("store_history", value=False)
@@ -160,3 +192,34 @@ def dace_context(**kwargs: Any) -> Generator[None, None, None]:
     with dace.config.temporary_config():
         set_dace_config(**kwargs)
         yield
+
+
+def serialize_sdfg_as_json(sdfg: dace.SDFG) -> dict[str, Any]:
+    """
+    Serialize an SDFG to JSON while removing ``guid`` keys.
+
+    `guid` is a per-element identity token: it does not affect code generation, and
+    `SDFG.from_json()` assigns fresh ids anyway. Keeping it would make the compile
+    cache key depend on element creation order, so two structurally identical
+    lowerings of the same program would not share a cached build.
+    # FIXME(edopao): remove this workaround once the SDFG lowering is stable.
+
+    Note that the recursive implementation to drop ``guid`` keys is 2-3x faster than
+    the iterative one, on a large SDFG, and it is also simpler to read.
+
+    Note that we set 'hash=True' to compute the SDFG hash and store it in the JSON
+    object. We compute the hash in order to refresh `cfg_list` on the SDFG, which
+    makes the JSON serialization stable.
+    """
+    json_obj = sdfg.to_json(hash=True)
+
+    def _drop_guids(obj: Any) -> Any:
+        if isinstance(obj, dict):
+            return {k: _drop_guids(v) for k, v in obj.items() if k != "guid"}
+        if isinstance(obj, list):
+            return [_drop_guids(v) for v in obj]
+        if isinstance(obj, tuple):
+            return tuple(_drop_guids(v) for v in obj)
+        return obj
+
+    return _drop_guids(json_obj)

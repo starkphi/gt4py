@@ -24,7 +24,7 @@ from gt4py.cartesian.gtc.gtcpp import gtcpp, gtcpp_codegen
 from gt4py.cartesian.gtc.gtcpp.oir_to_gtcpp import OIRToGTCpp
 from gt4py.cartesian.gtc.gtir_to_oir import GTIRToOIR
 from gt4py.cartesian.gtc.passes.oir_pipeline import DefaultPipeline
-from gt4py.eve import codegen
+from gt4py.eve import codegen, formatting
 from gt4py.storage.cartesian import layout, layout_registry
 
 
@@ -101,9 +101,9 @@ class GTCppBindingsCodegen(codegen.TemplatedGenerator):
     def visit_GlobalParamDecl(self, node: gtcpp.GlobalParamDecl, **kwargs):
         if "external_arg" in kwargs:
             if kwargs["external_arg"]:
-                return "{dtype} {name}".format(name=node.name, dtype=self.visit(node.dtype))
-            else:
-                return "gridtools::stencil::global_parameter({name})".format(name=node.name)
+                return f"{self.visit(node.dtype)} {node.name}"
+
+            return f"gridtools::stencil::global_parameter({node.name})"
 
     def visit_Program(self, node: gtcpp.Program, **kwargs):
         assert "module_name" in kwargs
@@ -117,7 +117,7 @@ class GTCppBindingsCodegen(codegen.TemplatedGenerator):
     def apply(cls, root, *, module_name="stencil", **kwargs) -> str:
         generated_code = cls(kwargs.get("backend")).visit(root, module_name=module_name, **kwargs)
         if kwargs.get("format_source", True):
-            generated_code = codegen.format_source("cpp", generated_code, style="LLVM")
+            generated_code = formatting.format_cpp_source(generated_code)
 
         return generated_code
 

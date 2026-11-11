@@ -21,6 +21,7 @@ from gt4py.next.iterator.transforms import (
     cart_unroll,
     concat_where,
     dead_code_elimination,
+    expand_tuple_maps,
     fuse_as_fieldop,
     global_tmps,
     infer_domain,
@@ -202,7 +203,7 @@ def _max_domain_range_sizes(offset_provider: common.OffsetProvider) -> dict[str,
     """
     sizes: dict[str, int] = {}
     for provider in offset_provider.values():
-        if common.is_neighbor_connectivity(provider):
+        if common.is_neighbor_table(provider):
             src_dim = provider.__gt_type__().source_dim.value
             codomain_dim = provider.__gt_type__().codomain.value
             sizes[src_dim] = max(sizes.get(src_dim, 0), provider.ndarray.shape[0])
@@ -404,6 +405,9 @@ def apply_common_transforms(
     ir = inline_lifts.InlineLifts().visit(ir)
 
     ir = concat_where.expand_tuple_args(ir, offset_provider_type=offset_provider_type)  # type: ignore[assignment]  # always an itir.Program
+    ir = expand_tuple_maps.ExpandTupleMaps.apply(
+        ir, uids=uids, offset_provider_type=offset_provider_type
+    )
     ir = dead_code_elimination.dead_code_elimination(
         ir, uids=uids, offset_provider_type=offset_provider_type
     )  # domain inference does not support dead-code
@@ -441,12 +445,16 @@ def apply_common_transforms(
         symbolic_domain_sizes=symbolic_domain_sizes,
         allow_uninferred=True,
     )
-    ir = prune_empty_concat_where.prune_empty_concat_where(ir)
+    ir = prune_empty_concat_where.prune_empty_concat_where(
+        ir, offset_provider=offset_provider, symbolic_domain_sizes=symbolic_domain_sizes
+    )
     ir = remove_broadcast.RemoveBroadcast.apply(ir)
     ir = cast(itir.Program, ConstantFolding.apply(ir))
     # After ConstantFolding some K ranges may now be provably empty (e.g. when vertical_end
     # is small); prune those dead concat_where branches so they don't inflate the IR.
-    ir = prune_empty_concat_where.prune_empty_concat_where(ir)
+    ir = prune_empty_concat_where.prune_empty_concat_where(
+            ir, offset_provider=offset_provider, symbolic_domain_sizes=symbolic_domain_sizes
+        )
     _print_ir_block(
         "=== GTIR AFTER COMMON TRANSFORMS BEFORE INFER_DOMAIN ===", ir, enabled=print_ir
     )
@@ -600,7 +608,9 @@ def apply_common_transforms(
         symbolic_domain_sizes=symbolic_domain_sizes,
         allow_uninferred=True,
     )
-    ir = prune_empty_concat_where.prune_empty_concat_where(ir)
+    ir = prune_empty_concat_where.prune_empty_concat_where(
+            ir, offset_provider=offset_provider, symbolic_domain_sizes=symbolic_domain_sizes
+        )
     _print_ir_block("=== GTIR END ===", ir, enabled=print_ir)
 
     assert isinstance(ir, itir.Program)
@@ -634,6 +644,9 @@ def apply_fieldview_transforms(
     _print_ir_block("=== FIELDVIEW IR AFTER INLINING FUNDEFS ===", ir, enabled=True)
     # required for dead-code-elimination and `prune_empty_concat_where` pass
     ir = concat_where.expand_tuple_args(ir, offset_provider_type=offset_provider_type)  # type: ignore[assignment]  # always an itir.Program
+    ir = expand_tuple_maps.ExpandTupleMaps.apply(
+        ir, uids=uids, offset_provider_type=offset_provider_type
+    )
 
     ir = dead_code_elimination.dead_code_elimination(
         ir, offset_provider_type=offset_provider_type, uids=uids
@@ -679,7 +692,9 @@ def apply_fieldview_transforms(
         )
         ir = ConstantFolding.apply(ir)  # type: ignore[assignment]  # always an itir.Program
 
-        ir = prune_empty_concat_where.prune_empty_concat_where(ir)
+        ir = prune_empty_concat_where.prune_empty_concat_where(
+            ir, offset_provider=offset_provider, symbolic_domain_sizes=symbolic_domain_sizes
+        )
         _print_ir_block("=== FIELDVIEW IR AFTER PRUNING EMPTY CONCAT WHERE ===", ir, enabled=True)
 
     # RemoveBroadcast reads node.annex.domain (set by infer_program). For the structured
@@ -713,7 +728,9 @@ def apply_fieldview_transforms(
             offset_provider=offset_provider,
             allow_uninferred=True,
         )
-        ir = prune_empty_concat_where.prune_empty_concat_where(ir)
+        ir = prune_empty_concat_where.prune_empty_concat_where(
+            ir, offset_provider=offset_provider, symbolic_domain_sizes=symbolic_domain_sizes
+        )
         _prev_fuse_made_progress = True  # allow first iteration always
         for _iter in range(10):
             # If the previous iteration's FuseAsFieldOp made no progress, one more cleanup
@@ -784,7 +801,9 @@ def apply_fieldview_transforms(
             offset_provider=offset_provider,
             allow_uninferred=True,
         )
-        ir = prune_empty_concat_where.prune_empty_concat_where(ir)
+        ir = prune_empty_concat_where.prune_empty_concat_where(
+            ir, offset_provider=offset_provider, symbolic_domain_sizes=symbolic_domain_sizes
+        )
         ir = remove_broadcast.RemoveBroadcast.apply(ir)
     _print_ir_block("=== FINAL FIELDVIEW IR ===", ir, enabled=True)
     return ir

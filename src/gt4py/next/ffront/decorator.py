@@ -20,12 +20,11 @@ import types
 import typing
 import warnings
 from collections.abc import Callable
-from typing import Any, Generic, Optional, Sequence, TypeAlias
+from typing import Any, Generic, Optional, Self, Sequence, TypeAlias, Unpack, override
 
 from gt4py import eve
 from gt4py._core import definitions as core_defs
-from gt4py.eve import extended_typing as xtyping
-from gt4py.eve.extended_typing import Self, Unpack, override
+from gt4py.eve import xtyping
 from gt4py.next import (
     backend as next_backend,
     common,
@@ -47,7 +46,7 @@ from gt4py.next.ffront import (
 from gt4py.next.ffront.gtcallable import GTCallable
 from gt4py.next.instrumentation import hook_machinery, metrics
 from gt4py.next.iterator import ir as itir
-from gt4py.next.otf import arguments, compiled_program, options, toolchain
+from gt4py.next.otf import arguments, compiled_program, options, workflow
 from gt4py.next.type_system import type_info, type_specifications as ts, type_translation
 
 
@@ -91,7 +90,15 @@ class _CompilableGTEntryPointMixin(Generic[ffront_stages.DSLDefinitionT]):
     """
 
     definition_stage: ffront_stages.DSLDefinitionT
-    backend: Optional[next_backend.Backend]
+    # The backend is excluded from the fingerprint: it does not affect the
+    # lowering (which these program-likes cache by their definition/FOAST stage,
+    # e.g. when they appear in another program's closure variables), the
+    # backend-specific compilation is keyed separately in the backend's own
+    # caches, and fingerprinting the whole backend object graph is both wasteful
+    # and fragile (it may hold non-importable callables, see also test doubles).
+    backend: Optional[next_backend.Backend] = dataclasses.field(
+        metadata=utils.gt4py_metadata(fingerprint=False)
+    )
     compilation_options: options.CompilationOptions
 
     @abc.abstractmethod
@@ -130,6 +137,9 @@ class _CompilableGTEntryPointMixin(Generic[ffront_stages.DSLDefinitionT]):
         program_type = ffront_type_info.type_in_program_context(self.__gt_type__())
         assert isinstance(program_type, ts_ffront.ProgramType)
 
+        # The argument descriptor mapping built here must be kept in sync with the descriptors
+        # created in the explicitly-triggered-compilation code path
+        # `CompiledProgramsPool.compile()`.
         argument_descriptor_mapping: dict[type[arguments.ArgStaticDescriptor], Sequence[str]] = {}
 
         if static_params:
@@ -228,8 +238,7 @@ class Program(_CompilableGTEntryPointMixin[ffront_stages.DSLProgramDef]):
         grid_type: The grid type (cartesian or unstructured) to be used. If not explicitly given
             it will be deduced from actually occurring dimensions.
         connectivities: A dictionary holding static/compile-time information about the offset providers.
-            For now, it is used for ahead of time compilation in DaCe orchestrated programs,
-            i.e. DaCe programs that call GT4Py Programs -SDFGConvertible interface-.
+            Used as the offset provider in `compile` when none is passed explicitly.
     """
 
     @classmethod
@@ -253,9 +262,7 @@ class Program(_CompilableGTEntryPointMixin[ffront_stages.DSLProgramDef]):
 
     # TODO(ricoh): linting should become optional, up to the backend.
     def __post_init__(self) -> None:
-        no_args_past = toolchain.ConcreteArtifact(
-            self.past_stage, arguments.CompileTimeArgs.empty()
-        )
+        no_args_past = workflow.ConcreteArtifact(self.past_stage, arguments.CompileTimeArgs.empty())
         _ = self._frontend_transforms.past_lint(no_args_past).data
 
     @property
@@ -278,7 +285,7 @@ class Program(_CompilableGTEntryPointMixin[ffront_stages.DSLProgramDef]):
     @functools.cached_property
     def past_stage(self) -> ffront_stages.PASTProgramDef:
         # backwards compatibility for backends that do not support the full toolchain
-        no_args_def = toolchain.ConcreteArtifact(
+        no_args_def = workflow.ConcreteArtifact(
             self.definition_stage, arguments.CompileTimeArgs.empty()
         )
         return self._frontend_transforms.func_to_past(no_args_def).data
@@ -298,7 +305,7 @@ class Program(_CompilableGTEntryPointMixin[ffront_stages.DSLProgramDef]):
 
     @functools.cached_property
     def gtir(self) -> itir.Program:
-        no_args_past = toolchain.ConcreteArtifact(
+        no_args_past = workflow.ConcreteArtifact(
             data=ffront_stages.PASTProgramDef(
                 past_node=self.past_stage.past_node,
                 closure_vars=self.past_stage.closure_vars,
@@ -324,44 +331,6 @@ class Program(_CompilableGTEntryPointMixin[ffront_stages.DSLProgramDef]):
             compilation_options=dataclasses.replace(
                 self.compilation_options, static_params=_static_params
             ),
-        )
-
-    def with_bound_args(self, **kwargs: Any) -> ProgramWithBoundArgs:
-        """
-        Bind scalar, i.e. non field, program arguments.
-
-        Example (pseudo-code):
-
-        >>> import gt4py.next as gtx
-        >>> @gtx.program  # doctest: +SKIP
-        ... def program(condition: bool, out: gtx.Field[Dims[IDim], float]):  # noqa: F821 [undefined-name]
-        ...     sample_field_operator(condition, out=out)  # noqa: F821 [undefined-name]
-
-        Create a new program from `program` with the `condition` parameter set to `True`:
-
-        >>> program_with_bound_arg = program.with_bound_args(condition=True)  # doctest: +SKIP
-
-        The resulting program is equivalent to
-
-        >>> @gtx.program  # doctest: +SKIP
-        ... def program(condition: bool, out: gtx.Field[Dims[IDim], float]):  # noqa: F821 [undefined-name]
-        ...     sample_field_operator(condition=True, out=out)  # noqa: F821 [undefined-name]
-
-        and can be executed without passing `condition`.
-
-        >>> program_with_bound_arg(out, offset_provider={})  # doctest: +SKIP
-        """
-        for key in kwargs.keys():
-            if all(key != param.id for param in self.past_stage.past_node.params):
-                raise TypeError(f"Keyword argument '{key}' is not a valid program parameter.")
-
-        return ProgramWithBoundArgs(
-            bound_args=kwargs,
-            **{
-                field.name: getattr(self, field.name)
-                for field in dataclasses.fields(self)
-                if field.init
-            },
         )
 
     def __call__(
@@ -406,86 +375,6 @@ class Program(_CompilableGTEntryPointMixin[ffront_stages.DSLProgramDef]):
                 with next_embedded.context.update(offset_provider=offset_provider):
                     with embedded_program_call_context(self, args, offset_provider, kwargs):
                         self.definition_stage.definition(*args, **kwargs)
-
-
-try:
-    from gt4py.next.program_processors.runners.dace.program import (  # type: ignore[assignment]
-        Program,
-    )
-except ImportError:
-    pass
-
-
-@dataclasses.dataclass(frozen=True)
-class ProgramWithBoundArgs(Program):
-    bound_args: dict[str, float | int | bool] = dataclasses.field(default_factory=dict)
-
-    @override
-    def __call__(
-        self, *args: Any, offset_provider: common.OffsetProvider | None = None, **kwargs: Any
-    ) -> None:
-        if offset_provider is None:
-            offset_provider = {}
-        type_ = self.past_stage.past_node.type
-        assert isinstance(type_, ts_ffront.ProgramType)
-        new_type = ts_ffront.ProgramType(
-            definition=ts.FunctionType(
-                kw_only_args={
-                    k: v
-                    for k, v in type_.definition.kw_only_args.items()
-                    if k not in self.bound_args.keys()
-                },
-                pos_only_args=type_.definition.pos_only_args,
-                pos_or_kw_args={
-                    k: v
-                    for k, v in type_.definition.pos_or_kw_args.items()
-                    if k not in self.bound_args.keys()
-                },
-                returns=type_.definition.returns,
-            )
-        )
-
-        arg_types = [type_translation.from_value(arg) for arg in args]
-        kwarg_types = {k: type_translation.from_value(v) for k, v in kwargs.items()}
-
-        try:
-            # This error is also catched using `accepts_args`, but we do it manually here to give
-            # a better error message.
-            for name in self.bound_args.keys():
-                if name in kwargs:
-                    raise ValueError(f"Parameter '{name}' already set as a bound argument.")
-
-            type_info.accepts_args(
-                new_type, with_args=arg_types, with_kwargs=kwarg_types, raise_exception=True
-            )
-        except ValueError as err:
-            bound_arg_names = ", ".join([f"'{bound_arg}'" for bound_arg in self.bound_args.keys()])
-            raise TypeError(
-                f"Invalid argument types in call to program '{self.past_stage.past_node.id}' with "
-                f"bound arguments '{bound_arg_names}'."
-            ) from err
-
-        full_args = [*args]
-        full_kwargs = {**kwargs}
-        for index, param in enumerate(self.past_stage.past_node.params):
-            if param.id in self.bound_args.keys():
-                if index < len(full_args):
-                    full_args.insert(index, self.bound_args[param.id])
-                else:
-                    full_kwargs[str(param.id)] = self.bound_args[param.id]
-
-        return super().__call__(*tuple(full_args), offset_provider=offset_provider, **full_kwargs)
-
-    @override
-    def compile(
-        self,
-        offset_provider: common.OffsetProviderType
-        | common.OffsetProvider
-        | list[common.OffsetProviderType | common.OffsetProvider]
-        | None = None,
-        **static_args: list[xtyping.MaybeNestedInTuple[core_defs.Scalar]],
-    ) -> Self:
-        raise NotImplementedError("Compilation of programs with bound arguments is not implemented")
 
 
 @typing.overload
@@ -598,7 +487,7 @@ class FieldOperator(_CompilableGTEntryPointMixin[ffront_stages.DSLFieldOperatorD
     @functools.cached_property
     def foast_stage(self) -> ffront_stages.FOASTOperatorDef:
         return self._frontend_transforms.func_to_foast(
-            toolchain.ConcreteArtifact(
+            workflow.ConcreteArtifact(
                 data=self.definition_stage, args=arguments.CompileTimeArgs.empty()
             )
         ).data
@@ -817,7 +706,7 @@ def scan_operator(
     axis: common.Dimension,
     forward: bool = True,
     init: core_defs.Scalar = 0.0,
-    backend: next_backend.Backend | None | eve.NothingType = eve.NOTHING,
+    backend: next_backend.Backend | eve.NothingType | None = eve.NOTHING,
     grid_type: common.GridType | None = None,
 ) -> FieldOperator | Callable[[Callable], FieldOperator]:
     """
@@ -862,23 +751,3 @@ def scan_operator(
         )
 
     return scan_operator_inner if definition is None else scan_operator_inner(definition)
-
-
-@ffront_stages.add_content_to_fingerprint.register
-def add_fieldop_to_fingerprint(obj: FieldOperator, hasher: xtyping.HashlibAlgorithm) -> None:
-    ffront_stages.add_content_to_fingerprint(obj.definition_stage, hasher)
-    ffront_stages.add_content_to_fingerprint(obj.backend, hasher)
-
-
-@ffront_stages.add_content_to_fingerprint.register
-def add_foast_fieldop_to_fingerprint(
-    obj: FieldOperatorFromFoast, hasher: xtyping.HashlibAlgorithm
-) -> None:
-    ffront_stages.add_content_to_fingerprint(obj.foast_stage, hasher)
-    ffront_stages.add_content_to_fingerprint(obj.backend, hasher)
-
-
-@ffront_stages.add_content_to_fingerprint.register
-def add_program_to_fingerprint(obj: Program, hasher: xtyping.HashlibAlgorithm) -> None:
-    ffront_stages.add_content_to_fingerprint(obj.definition_stage, hasher)
-    ffront_stages.add_content_to_fingerprint(obj.backend, hasher)

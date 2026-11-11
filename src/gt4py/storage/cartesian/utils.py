@@ -19,7 +19,7 @@ import numpy.typing as npt
 from numpy.typing import DTypeLike
 
 from gt4py._core import definitions as core_defs
-from gt4py.eve.extended_typing import ArrayInterface, CUDAArrayInterface
+from gt4py.eve.xtyping import ArrayInterface, CUDAArrayInterface
 from gt4py.storage import allocators
 
 
@@ -149,7 +149,7 @@ def normalize_storage_spec(
         aligned_index = tuple(aligned_index)
 
         if any(i < 0 for i in aligned_index):
-            raise ValueError("aligned_index ({}) contains negative value.".format(aligned_index))
+            raise ValueError(f"aligned_index ({aligned_index}) contains negative value.")
     else:
         raise TypeError("aligned_index must be an iterable of ints.")
 

@@ -17,7 +17,9 @@ from typing import TYPE_CHECKING, ClassVar
 from dace import SDFG, Memlet, SDFGState, config, data, dtypes, nodes, subsets, symbolic
 from dace.codegen import codeobject
 from dace.sdfg.analysis.schedule_tree import treenodes as tn
+from dace.sdfg.dealias import convert_legacy_nested_sdfgs
 from dace.sdfg.utils import inline_sdfgs
+from dace.transformation.dataflow import MapCollapse
 
 from gt4py._core import definitions as core_defs
 from gt4py.cartesian import config as gt_config, definitions
@@ -44,7 +46,7 @@ from gt4py.cartesian.gtc.passes.oir_optimizations import caches
 from gt4py.cartesian.gtc.passes.oir_optimizations.utils import compute_fields_extents
 from gt4py.cartesian.gtc.passes.oir_pipeline import DefaultPipeline
 from gt4py.cartesian.utils import shash
-from gt4py.eve import codegen
+from gt4py.eve import formatting
 from gt4py.eve.codegen import MakoTemplate as as_mako
 from gt4py.storage.cartesian import layout, layout_registry
 
@@ -95,6 +97,7 @@ def _sdfg_add_arrays_and_edges(
     inputs: set[str] | dict[str, dtypes.typeclass],
     outputs: set[str] | dict[str, dtypes.typeclass],
     origins: dict[str, tuple[int, ...]],
+    domain: tuple[int, ...],
 ) -> None:
     for name, array in inner_sdfg.arrays.items():
         if array.transient:
@@ -129,12 +132,20 @@ def _sdfg_add_arrays_and_edges(
                 if axis not in axes:
                     continue
                 o = origin[index]
-                e = field_info[name].boundary.lower_indices[cartesian_index]
+                lower, upper = field_info[name].boundary[cartesian_index]
                 s = inner_sdfg.arrays[name].shape[index]
-                ranges.append(
-                    # s - 1 because ranges are inclusive
-                    (o - max(0, e), o - max(0, e) + s - 1, 1)
-                )
+                if axis == CartesianSpace.Axis.K.name:
+                    d = domain[cartesian_index]
+                    ranges.append(
+                        # max(0, lower) because ...
+                        # d - 1 because ranges are inclusive
+                        (o - max(0, lower), o + upper + d - 1, 1)
+                    )
+                else:
+                    ranges.append(
+                        # s - 1 because ranges are inclusive
+                        (o - max(0, lower), o - max(0, lower) + s - 1, 1)
+                    )
                 index += 1
 
             # Add data dimensions to the range
@@ -257,19 +268,27 @@ def freeze_origin_domain_sdfg(
     state = wrapper_sdfg.add_state("frozen_" + inner_sdfg.name + "_state")
 
     # gather inputs & outputs (i.e. reads/writes without transients)
-    inputs, outputs = inner_sdfg.read_and_write_sets()
-    inputs = set(filter(lambda name: not inner_sdfg.arrays[name].transient, inputs))
-    outputs = set(filter(lambda name: not inner_sdfg.arrays[name].transient, outputs))
+    read_set, write_set = inner_sdfg.read_and_write_sets()
+    inputs = {
+        name: None
+        for name, desc in inner_sdfg.arrays.items()
+        if name in read_set and not desc.transient
+    }
+    outputs = {
+        name: None
+        for name, desc in inner_sdfg.arrays.items()
+        if name in write_set and not desc.transient
+    }
 
     nsdfg = state.add_nested_sdfg(inner_sdfg, inputs, outputs)
 
     _sdfg_add_arrays_and_edges(
-        field_info, wrapper_sdfg, state, inner_sdfg, nsdfg, inputs, outputs, origin
+        field_info, wrapper_sdfg, state, inner_sdfg, nsdfg, inputs, outputs, origin, domain
     )
 
     # in special case of empty domain, remove entire SDFG.
     if any(d == 0 for d in domain):
-        states = wrapper_sdfg.states()
+        states = list(wrapper_sdfg.states())
         assert len(states) == 1
         for node in states[0].nodes():
             state.remove_node(node)
@@ -278,6 +297,9 @@ def freeze_origin_domain_sdfg(
     for symbol in nsdfg.sdfg.free_symbols:
         if symbol not in wrapper_sdfg.symbols:
             wrapper_sdfg.add_symbol(symbol, nsdfg.sdfg.symbols[symbol])
+
+    # Converts the legacy nested SDFGs of `wrapper_sdfg` before handing it to `inline_sdfgs`
+    convert_legacy_nested_sdfgs(wrapper_sdfg)
 
     # Try to inline wrapped SDFG before symbols are specialized to avoid extra views
     inline_sdfgs(wrapper_sdfg)
@@ -397,16 +419,33 @@ class SDFGManager:
             flipper = passes.SwapHorizontalMaps()
             flipper.visit(stree)
 
+        K_loop_pushed_down = False  # To keep code clean we bookeep operation
         if layout[2] != 0:
+            K_loop_pushed_down = True
             flipper = passes.PushVerticalMapDown()
+            flipper.visit(stree)
+
+        # Re-order sequential K to maximize parallelism when targeting parallel
+        # backend and hardware options
+        is_threaded = "OMP_NUM_THREADS" in os.environ and int(os.environ["OMP_NUM_THREADS"]) > 1
+        if not K_loop_pushed_down and (
+            self.builder.backend.storage_info["device"] == "gpu"
+            or (self.builder.backend.storage_info["device"] == "cpu" and is_threaded)
+        ):
+            flipper = passes.PushVerticalMapDown(forscope_only=True)
             flipper.visit(stree)
 
         # Create SDFG
         sdfg = stree.as_sdfg(
             validate=validate,
             simplify=simplify,
-            skip={"ScalarToSymbolPromotion", "ControlFlowRaising"},
+            # We skip
+            #  - `ScalarToSymbolPromotion` because we've seen validation issue in the past
+            #  - `ControlFlowRaising` because we already generate CFGs in stree -> SDFG
+            #  - `LiftTrivialIf` because it's dead slow (e.g. fv3 acoustics parsing takes >90min compared to 10-15min without)
+            skip={"ScalarToSymbolPromotion", "ControlFlowRaising", "LiftTrivialIf"},
         )
+        sdfg.apply_transformations_repeated(MapCollapse, progress=False, validate=False)
 
         if do_cache:
             self._save_sdfg(sdfg, path)
@@ -464,11 +503,11 @@ class DaCeExtGenerator(BackendCodegen):
         manager = SDFGManager(self.backend.builder)
 
         sdfg = manager.sdfg_via_schedule_tree()
-        _specialize_transient_strides(
-            sdfg,
-            self.backend.storage_info,
-        )
-        sdfg.simplify(validate=True, skip={"ScalarToSymbolPromotion"})
+        _specialize_transient_strides(sdfg, self.backend.storage_info)
+        # We skip
+        #  - `ScalarToSymbolPromotion` because we've seen validation issues in the past
+        #  - `LiftTrivialIf` because it's dead slow (e.g. fv3 acoustics parsing takes >90min compared to 10-15min without)
+        sdfg.simplify(validate=True, skip={"ScalarToSymbolPromotion", "LiftTrivialIf"})
 
         # NOTE
         # The glue code in DaCeComputationCodegen.apply() (just below) will define all the
@@ -571,8 +610,6 @@ auto ${name}(const std::array<gt::uint_t, 3>& domain) {
             line = line.strip()
             if line == '#include "../../include/hash.h"':
                 return False
-            if line.startswith("DACE_EXPORTED") and line.endswith(");"):
-                return False
             if line == "#include <cuda_runtime.h>":
                 return False
             return True
@@ -646,7 +683,7 @@ namespace gt = gridtools;
 """
 
         if builder.options.format_source:
-            generated_code = codegen.format_source("cpp", generated_code, style="LLVM")
+            generated_code = formatting.format_cpp_source(generated_code)
 
         return generated_code
 
@@ -830,7 +867,7 @@ class DaCeBindingsCodegen:
     def apply(cls, sdfg: SDFG, module_name: str, *, backend: BaseDaceBackend) -> str:
         generated_code = cls(backend).generate_sdfg_bindings(sdfg, module_name)
         if backend.builder.options.format_source:
-            generated_code = codegen.format_source("cpp", generated_code, style="LLVM")
+            generated_code = formatting.format_cpp_source(generated_code)
         return generated_code
 
 
@@ -920,9 +957,26 @@ class DaceCPU_KJI(BaseDaceBackend):
 
 @register
 class DaceGPUBackend(BaseDaceBackend):
-    """DaCe python backend using gt4py.cartesian.gtc."""
+    """GPU DaCe python with an optimal KJI loop layout"""
 
     name = "dace:gpu"
+    languages: ClassVar[dict] = {"computation": "cuda", "bindings": ["python"]}
+    storage_info: ClassVar[layout.LayoutInfo] = layout_registry.from_name(name)
+    MODULE_GENERATOR_CLASS = DaCeCUDAPyExtModuleGenerator
+    options: ClassVar[GTBackendOptions] = {
+        **BaseGTBackend.GT_BACKEND_OPTS,
+        "device_sync": {"versioning": True, "type": bool},
+    }
+
+    def generate_extension(self) -> None:
+        return self.make_extension(uses_cuda=True)
+
+
+@register
+class DaceGPUBackendIJK(BaseDaceBackend):
+    """GPU DaCe python with an optimal IJK loop layout"""
+
+    name = "dace:gpu_IJK"
     languages: ClassVar[dict] = {"computation": "cuda", "bindings": ["python"]}
     storage_info: ClassVar[layout.LayoutInfo] = layout_registry.from_name(name)
     MODULE_GENERATOR_CLASS = DaCeCUDAPyExtModuleGenerator

@@ -10,10 +10,11 @@ from __future__ import annotations
 
 import sys
 import typing
+from collections.abc import Callable
+from typing import Optional, TypeAlias, TypeVar, Unpack
 
 from gt4py import eve
 from gt4py.eve import utils as eve_utils
-from gt4py.eve.extended_typing import Callable, Optional, TypeAlias, Unpack
 from gt4py.next import common, utils as gtx_utils
 from gt4py.next.iterator import builtins, ir as itir
 from gt4py.next.iterator.ir_utils import (
@@ -54,11 +55,15 @@ DomainAccess: TypeAlias = NonTupleDomainAccess | tuple["DomainAccess", ...]
 AccessedDomains: TypeAlias = dict[str, DomainAccess]
 
 
+_Expr_T = TypeVar("_Expr_T", bound=itir.Expr)
+
+
 class InferenceOptions(typing.TypedDict):
     offset_provider: common.OffsetProvider | common.OffsetProviderType
     symbolic_domain_sizes: dict[str, itir.Expr] | None
     allow_uninferred: bool
     keep_existing_domains: bool
+    revisit_already_inferred: bool
 
 
 class DomainAnnexDebugger(eve.NodeVisitor):
@@ -223,6 +228,7 @@ def _infer_as_fieldop(
     symbolic_domain_sizes: Optional[dict[str, itir.Expr]],
     allow_uninferred: bool,
     keep_existing_domains: bool,
+    revisit_already_inferred: bool,
 ) -> tuple[itir.FunCall, AccessedDomains]:
     assert isinstance(applied_fieldop, itir.FunCall)
     assert cpm.is_call_to(applied_fieldop.fun, "as_fieldop")
@@ -272,6 +278,7 @@ def _infer_as_fieldop(
             symbolic_domain_sizes=symbolic_domain_sizes,
             allow_uninferred=allow_uninferred,
             keep_existing_domains=keep_existing_domains,
+            revisit_already_inferred=revisit_already_inferred,
         )
         transformed_inputs.append(transformed_input)
 
@@ -471,18 +478,14 @@ def _infer_concat_where(
             else symbolic_domain
         )
 
-    for arg in [true_field, false_field]:
+    for arg, selected_domain in ((true_field, symbolic_cond), (false_field, cond_complement)):
 
         @tree_map
         def mapper(d: NonTupleDomainAccess):
             if isinstance(d, DomainAccessDescriptor):
                 return d
-            promoted_source = _remap_legacy_horizontal_domain(
-                symbolic_cond if arg == true_field else cond_complement,
-                d.ranges.keys(),
-            )
             promoted_cond = domain_utils.promote_domain(
-                promoted_source,
+                _remap_legacy_horizontal_domain(selected_domain, d.ranges.keys()),  # noqa: B023
                 d.ranges.keys(),
             )
             return domain_utils.domain_intersection(d, promoted_cond)
@@ -544,14 +547,15 @@ def _infer_expr(
 
 
 def infer_expr(
-    expr: itir.Expr,
+    expr: _Expr_T,
     domain: DomainAccess,
     *,
     offset_provider: common.OffsetProvider | common.OffsetProviderType,
     symbolic_domain_sizes: Optional[dict[str, itir.Expr]] = None,
     allow_uninferred: bool = False,
     keep_existing_domains: bool = False,
-) -> tuple[itir.Expr, AccessedDomains]:
+    revisit_already_inferred: bool = True,
+) -> tuple[_Expr_T, AccessedDomains]:
     """
     Infer the domain of all field subexpressions of `expr`.
 
@@ -573,12 +577,19 @@ def infer_expr(
       but we can't reinfer everything because some domain access information has been lost.
       For example when a `concat_where` is transformed into an `as_fieldop` with an if we lose
       some information that could lead to unnecessary overcomputation and out-of-bounds accesses.
+    - revisit_already_inferred: If `False`, subexpressions that already have a domain (in their
+      annex) are neither descended into nor altered. Useful together with
+      `keep_existing_domains` to cheaply populate the domains of nodes newly created by a
+      transformation on an already inferred expression. Note that accesses inside skipped
+      subexpressions are not reported in the returned accessed domains.
 
     Returns:
       A tuple containing the inferred expression with all applied `as_fieldop` (that are accessed)
       having a domain argument now, and a dictionary mapping symbol names referenced in `expr` to
       domain they are accessed at.
     """
+    if not revisit_already_inferred and hasattr(expr.annex, "domain"):
+        return expr, {}
 
     itir_type_inference.reinfer(
         expr, offset_provider_type=common.offset_provider_to_type(offset_provider)
@@ -614,18 +625,20 @@ def infer_expr(
         )
     )(domain, el_types, additional_dims)
 
-    expr, accessed_domains = _infer_expr(
+    inferred_expr, accessed_domains = _infer_expr(
         expr,
         domain,
         offset_provider=offset_provider,
         symbolic_domain_sizes=symbolic_domain_sizes,
         allow_uninferred=allow_uninferred,
         keep_existing_domains=keep_existing_domains,
+        revisit_already_inferred=revisit_already_inferred,
     )
-    if not keep_existing_domains or not hasattr(expr.annex, "domain"):
-        expr.annex.domain = domain
+    if not keep_existing_domains or not hasattr(inferred_expr.annex, "domain"):
+        inferred_expr.annex.domain = domain
 
-    return expr, accessed_domains
+    # `_infer_expr` preserves the node class, e.g. a `FunCall` is rebuilt as a `FunCall`
+    return typing.cast(_Expr_T, inferred_expr), accessed_domains
 
 
 def _make_symbolic_domain_tuple(domains: itir.Node) -> DomainAccess:
@@ -669,6 +682,7 @@ def infer_program(
     symbolic_domain_sizes: Optional[dict[str, itir.Expr]] = None,
     allow_uninferred: bool = False,
     keep_existing_domains: bool = False,
+    revisit_already_inferred: bool = True,
 ) -> itir.Program:
     """
     Infer the domain of all field subexpressions inside a program.
@@ -723,6 +737,7 @@ def _infer_program_impl(
                 symbolic_domain_sizes=symbolic_domain_sizes,
                 allow_uninferred=allow_uninferred,
                 keep_existing_domains=keep_existing_domains,
+                revisit_already_inferred=revisit_already_inferred,
             )
             for stmt in program.body
         ],

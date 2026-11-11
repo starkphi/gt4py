@@ -5,6 +5,16 @@
 #
 # Please, refer to the LICENSE file in the root directory.
 # SPDX-License-Identifier: BSD-3-Clause
+"""Framework for gt4py.next integration ("feature") tests.
+
+A test requests the ``cartesian_case`` / ``unstructured_case`` fixture -- a
+``Case`` bundling a backend, allocator, offset provider and default sizes --
+builds inputs with ``allocate(...)``, and checks results with ``verify(...)`` /
+``verify_with_default_data(...)``. The backend matrix these fixtures
+parametrize over, and the per-backend skip/xfail lists, live in
+``next_tests.definitions`` (see ADR 0015). The shared fixtures and the
+dimension / offset / field aliases live in the sibling ``cases_utils`` module.
+"""
 
 from __future__ import annotations
 
@@ -14,15 +24,14 @@ import functools
 import inspect
 import types
 import typing
-from typing import Any, Callable, Literal, Optional, Mapping, Protocol, TypeAlias
+from typing import Any, Callable, Literal, Optional, Mapping, Protocol, Self, TypeAlias
 
 import numpy as np
 import pytest
+import typing_extensions
 
 import gt4py.next as gtx
 from gt4py._core import definitions as core_defs
-from gt4py.eve import extended_typing as xtyping
-from gt4py.eve.extended_typing import Self
 from gt4py.next import (
     backend as next_backend,
     common,
@@ -37,7 +46,7 @@ from gt4py.next.type_system import type_specifications as ts, type_translation
 from gt4py.next.otf import arguments
 
 from next_tests import definitions as test_definitions
-from next_tests.integration_tests.feature_tests.ffront_tests.ffront_test_utils import (  # noqa: F401 [unused-import]
+from next_tests.integration_tests.cases_utils import (  # noqa: F401 [unused-import]
     C2E,
     C2V,
     E2V,
@@ -48,12 +57,11 @@ from next_tests.integration_tests.feature_tests.ffront_tests.ffront_test_utils i
     E2VDim,
     Edge,
     IDim,
-    Ioff,
+    IHalfDim,
     JDim,
-    Joff,
+    JHalfDim,
     KDim,
     KHalfDim,
-    Koff,
     V2EDim,
     Vertex,
     exec_alloc_descriptor,
@@ -67,6 +75,7 @@ from next_tests.integration_tests.feature_tests.ffront_tests.ffront_test_utils i
 # mypy does not accept [IDim, ...] as a type
 
 IField: TypeAlias = gtx.Field[[IDim], np.int32]  # type: ignore [valid-type]
+IHalfField: TypeAlias = gtx.Field[[IHalfDim], np.int32]  # type: ignore [valid-type]
 JField: TypeAlias = gtx.Field[[JDim], np.int32]  # type: ignore [valid-type]
 IFloatField: TypeAlias = gtx.Field[[IDim], np.float64]  # type: ignore [valid-type]
 IBoolField: TypeAlias = gtx.Field[[IDim], bool]  # type: ignore [valid-type]
@@ -494,6 +503,7 @@ def verify_with_default_data(
     case: Case,
     fieldop: decorator.FieldOperator,
     ref: Callable,
+    offset_provider: Optional[OffsetProvider] = None,
     comparison: Callable[[Any, Any], bool] = tree_mapped_np_allclose,
 ) -> None:
     """
@@ -508,6 +518,8 @@ def verify_with_default_data(
         fieldview_prog: The field operator or program to be verified.
         ref: A callable which will be called with all the input arguments
             of the fieldview code, after applying ``.ndarray`` on the fields.
+        offset_provider: An override for the test case's offset_provider.
+            Use with care!
         comparison: A comparison function, which will be called as
             ``comparison(ref, <out | inout>)`` and should return a boolean.
     """
@@ -521,7 +533,7 @@ def verify_with_default_data(
         *inps,
         **kwfields,
         ref=ref(*ref_args),
-        offset_provider=case.offset_provider,
+        offset_provider=offset_provider,
         comparison=comparison,
     )
 
@@ -572,7 +584,7 @@ def unstructured_case_3d(unstructured_case):
     return dataclasses.replace(
         unstructured_case,
         default_sizes={**unstructured_case.default_sizes, KDim: 10},
-        offset_provider={**unstructured_case.offset_provider, "Koff": KDim},
+        offset_provider=unstructured_case.offset_provider,
     )
 
 
@@ -632,7 +644,7 @@ def get_param_types(
         raise ValueError(
             f"test cases do not support '{type(fieldview_prog)}' with empty .definition attribute (as you would get from .as_program())."
         )
-    annotations = xtyping.get_type_hints(fieldview_prog.definition)
+    annotations = typing_extensions.get_type_hints(fieldview_prog.definition)
     return {
         name: type_translation.from_type_hint(type_hint) for name, type_hint in annotations.items()
     }
@@ -724,7 +736,9 @@ class Case:
                 IDim: grid_descriptor.sizes[0],
                 JDim: grid_descriptor.sizes[1],
                 KDim: grid_descriptor.sizes[2],
-                KHalfDim: grid_descriptor.sizes[3],
+                IHalfDim: grid_descriptor.sizes[0] - 1,
+                JHalfDim: grid_descriptor.sizes[1] - 1,
+                KHalfDim: grid_descriptor.sizes[2] - 1,
             },
             grid_type=common.GridType.CARTESIAN,
             allocator=allocator,
