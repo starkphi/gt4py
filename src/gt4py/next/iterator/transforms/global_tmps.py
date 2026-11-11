@@ -119,30 +119,55 @@ def _is_as_fieldop_of_scan(expr: itir.Expr) -> bool:
     )
 
 
-def _restrict_branch_domain(branch: itir.Expr, if_domain: object) -> itir.Expr:
-    """Clip the domain of an `if_` branch to the domain of the `if_` itself.
+def _clip_domain(branch_domain: object, if_domain: object) -> object:
+    """Intersect a (possibly tuple-valued) branch domain with the domain of the enclosing `if_`.
 
-    Each branch becomes its own `SetAt`, whose domain is taken from the branch's `annex.domain`
-    (`_populate_and_homogenize_domains`), while a temporary holding the `if_` is allocated with the
-    `if_`'s domain. Normally both are equal. In the structured pipeline (domain inference keeps
-    existing domains, fusion rebuilds the IR) a branch can keep an older, larger domain, e.g.
-    `if rayleigh_type == KLEMP: tmp = w else: tmp = w` with w on K [0, nlev+1) but tmp allocated on
-    [0, nlev) → the branch wrote one level past the temporary (out-of-bounds write on GPU and CPU).
-    The intersection never writes outside the allocation and never computes more than the branch's
-    inputs were inferred for. Unchanged if the domains are equal (always in the unstructured pipeline).
+    A branch annex can be a single domain while the `if_` domain is a tuple (e.g. a reference to a
+    tuple-valued temporary); in that case the branch domain is broadcast to all tuple elements.
+    Elements whose dimensions do not match, or that are `NEVER`, take the `if_` element domain.
     """
-    branch_domain = getattr(branch.annex, "domain", None)
+    if isinstance(if_domain, tuple):
+        if not isinstance(branch_domain, tuple):
+            branch_domain = tuple(branch_domain for _ in if_domain)
+        if len(branch_domain) != len(if_domain):
+            return if_domain
+        return tuple(_clip_domain(b, i) for b, i in zip(branch_domain, if_domain, strict=True))
     if (
         not isinstance(if_domain, SymbolicDomain)
         or not isinstance(branch_domain, SymbolicDomain)
-        or branch_domain == if_domain
-        or set(branch_domain.ranges) != set(if_domain.ranges)
         or branch_domain.grid_type != if_domain.grid_type
+        or branch_domain.ranges.keys() != if_domain.ranges.keys()
     ):
+        return if_domain
+    if branch_domain == if_domain:
+        return branch_domain
+    return domain_utils.domain_intersection(branch_domain, if_domain)
+
+
+def _restrict_branch_domain(branch: itir.Expr, if_domain: object) -> itir.Expr:
+    """Restrict the domain of an `if_` branch to the domain of the `if_` itself.
+
+    Each branch of a top-level `if_` becomes its own `SetAt` whose domain is taken from the branch's
+    `annex.domain` (see `_populate_and_homogenize_domains`), while a temporary holding the `if_` is
+    allocated with the domain of the `if_`. The branch annex can be larger: `_transform_by_pattern`
+    substitutes every use of an extracted value by a reference annotated with the domain of the
+    whole temporary, i.e. the union over all its uses. If the extracted value is also read shifted
+    elsewhere, e.g.
+
+        w = inp * 2.0
+        w2 = w
+        if c == 2:
+            w2 = w
+        return w2, w(KDim + 1)
+
+    the branches write `w` on `K[0, n+1)` into a temporary (or output) of size `K[0, n)`.
+    Intersecting with the `if_` domain never writes outside the target and never computes more than
+    what the branch's own inputs were inferred for.
+    """
+    branch_domain = getattr(branch.annex, "domain", None)
+    if if_domain is None or branch_domain is None:
         return branch
-    branch.annex.domain = domain_utils._reduce_domains(
-        branch_domain, if_domain, range_reduce_op=domain_utils._range_intersection
-    )
+    branch.annex.domain = _clip_domain(branch_domain, if_domain)
     return branch
 
 
