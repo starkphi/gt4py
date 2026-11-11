@@ -44,19 +44,48 @@ _CURRENT_COMPILE_SDS: dict | None = None
 # GT4PY_STRUCTURED_TIMING=1: accumulate per-program pack / compile-lookup / exec / unpack wall times and per-argument
 # pack/unpack times; the report is printed at interpreter exit (first call of each program excluded: it compiles).
 _TIMING = os.environ.get("GT4PY_STRUCTURED_TIMING", "0") == "1"
-_TIMES: dict = {}  # program -> {"calls", "pack", "lookup", "exec", "unpack"}
+_TIMES: dict = {}  # program -> {"calls", "pack", "lookup", "exec", "unpack", "call", "nfields", "mbytes"}
+_POOL_PEAK = [0, 0]  # cupy default memory pool: max used_bytes, max total_bytes seen after exec (GPU only)
+
+
+def _use_xp_pack(field) -> bool:
+    """Global mode: pack/unpack cupy fields on the device instead of via host numpy.
+
+    numpy fields keep the host path: the namespace path also works with numpy (bitwise equal, icon4py_kb/scripts/
+    test_xp_pack.py) but packed ~25 % slower on CPU (gtfn_cpu R02B04 JW: pack 53.6 s vs 42.3 s; extra full pass).
+    GT4PY_GLOBAL_PACK_DEVICE=0 restores the host path for cupy too (A/B check). The DaCe K-layout experiments
+    (DACE_K_WARP, DACE_K_INNER_LAYOUT) re-pack from host arrays and keep the host path."""
+    return (
+        cp is not None
+        and isinstance(getattr(field, "ndarray", None), cp.ndarray)
+        and os.environ.get("GT4PY_GLOBAL_PACK_DEVICE", "1") != "0"
+        and os.environ.get("DACE_K_WARP", "0") == "0"
+        and os.environ.get("DACE_K_INNER_LAYOUT", "0") != "1"
+    )
 _ARG_TIMES: dict = {}  # (program, arg, "pack"|"unpack", kind) -> [calls, seconds]
 
 
 def _report_timing() -> None:
     if not _TIMES:
         return
-    tot = {k: sum(t[k] for t in _TIMES.values()) for k in ("pack", "lookup", "exec", "unpack")}
+    keys = ("pack", "lookup", "exec", "unpack", "call", "nfields", "mbytes")
+    tot = {k: sum(t[k] for t in _TIMES.values()) for k in keys}
+    tot["calls"] = sum(t["calls"] for t in _TIMES.values())
+
+    def _other(t):  # call time not in pack/lookup/exec/unpack: argument mapping, thresholds, strides, Python glue
+        return t["call"] - t["pack"] - t["lookup"] - t["exec"] - t["unpack"]
+
     print("===== structured wrapper timing (s, first call per program excluded) =====")
-    print(f"{'program':60s} {'calls':>6s} {'pack':>9s} {'lookup':>9s} {'exec':>9s} {'unpack':>9s}")
-    for name, t in sorted(_TIMES.items(), key=lambda kv: -(kv[1]["pack"] + kv[1]["exec"] + kv[1]["unpack"])):
-        print(f"{name[:60]:60s} {t['calls']:6d} {t['pack']:9.3f} {t['lookup']:9.3f} {t['exec']:9.3f} {t['unpack']:9.3f}")
-    print(f"{'TOTAL':60s} {'':6s} {tot['pack']:9.3f} {tot['lookup']:9.3f} {tot['exec']:9.3f} {tot['unpack']:9.3f}")
+    print(f"{'program':55s} {'calls':>6s} {'pack':>9s} {'lookup':>9s} {'exec':>9s} {'unpack':>9s} {'other':>8s} {'call':>9s}"
+          f" {'fld/call':>8s} {'MB/call':>8s}")
+    for name, t in sorted(_TIMES.items(), key=lambda kv: -kv[1]["call"]):
+        n = max(t["calls"], 1)
+        print(f"{name[:55]:55s} {t['calls']:6d} {t['pack']:9.3f} {t['lookup']:9.3f} {t['exec']:9.3f} {t['unpack']:9.3f}"
+              f" {_other(t):8.3f} {t['call']:9.3f} {t['nfields'] / n:8.1f} {t['mbytes'] / n:8.1f}")
+    print(f"{'TOTAL':55s} {tot['calls']:6d} {tot['pack']:9.3f} {tot['lookup']:9.3f} {tot['exec']:9.3f} {tot['unpack']:9.3f}"
+          f" {_other(tot):8.3f} {tot['call']:9.3f} {tot['nfields']:8d} {tot['mbytes']:8.0f}")
+    if _POOL_PEAK[1]:
+        print(f"cupy pool peak after exec: used {_POOL_PEAK[0] / 2**30:.2f} GiB, held {_POOL_PEAK[1] / 2**30:.2f} GiB")
     by_kind: dict = {}
     for (_, _, what, kind), (_, s) in _ARG_TIMES.items():
         by_kind[what, kind] = by_kind.get((what, kind), 0.0) + s
@@ -656,6 +685,70 @@ class GlobalPackTables:
     def edge_sign_for(self, name: str | None) -> np.ndarray | None:
         _check_global_name(name, "edge")
         return self.e_sign if name in _GLOBAL_VECTOR_EDGE_FIELDS else None
+
+    # ---- array-namespace path (stage 2 of agent_reports/2026-11-10_perf_design.md): numpy or cupy, no host round trip ----
+    # Same values as pack/unpack/pack_sparse above (bitwise), but the tables live in the field's namespace (uploaded once per
+    # namespace) and the IDim warp padding of _make_structured_field is folded into the gather table (pad rows = -1 -> 0).
+
+    def xp_tables(self, xp, pad_i: bool) -> dict:
+        """Tables converted to namespace ``xp`` (numpy or cupy), cached; ``pad_i`` pads IDim of gather / e_sign to 32."""
+        key = (xp.__name__, pad_i)
+        cache = self.__dict__.setdefault("_xp_cache", {})
+        if key not in cache:
+            def _pad(a, fill):
+                ni = a.shape[0]
+                ni32 = ((ni + 31) // 32) * 32 if pad_i else ni
+                if ni32 == ni:
+                    return a
+                out = np.full((ni32, *a.shape[1:]), fill, dtype=a.dtype)
+                out[:ni] = a
+                return out
+
+            t = {"gather": {}, "valid": {}, "slots": {}}
+            for x, g in self.gather.items():
+                gp = _pad(g, -1)
+                t["valid"][x] = xp.asarray(gp >= 0)
+                t["gather"][x] = xp.asarray(np.maximum(gp, 0))
+                t["slots"][x] = tuple(xp.asarray(self.slots[x][:, c].astype(np.int64)) for c in range(3))
+            t["e_sign"] = None if self.e_sign is None else xp.asarray(_pad(self.e_sign, 1))
+            if not pad_i:
+                t["sparse"] = {k: xp.asarray(v) for k, v in self.sparse.items()}
+                t["e_sign_raw"] = None if self.e_sign is None else xp.asarray(self.e_sign)
+                t["tsign"] = {k: xp.asarray(v) for k, v in self.tsign.items()}
+            cache[key] = t
+        return cache[key]
+
+    def pack_xp(self, xp, values, x: str, sign_name: str | None, pad_i: bool):
+        """Dense pack of ``values`` [n_entity, *tail] into the (padded) frame [I, J, Kolor, *tail], in namespace ``xp``."""
+        t = self.xp_tables(xp, pad_i)
+        tail = (None,) * (values.ndim - 1)
+        out = values[t["gather"][x]]
+        if x == "e" and self.edge_sign_for(sign_name) is not None:
+            out = out * t["e_sign"][(..., *tail)].astype(values.dtype)
+        return xp.where(t["valid"][x][(..., *tail)], out, xp.zeros((), dtype=values.dtype)).astype(values.dtype, copy=False)
+
+    def unpack_xp(self, xp, struct_values, x: str):
+        """Owned slots of ``struct_values`` [I(+pad), J, Kolor, *tail] as [n_entity, *tail], in namespace ``xp``."""
+        si, sj, sk = self.xp_tables(xp, False)["slots"][x]
+        return struct_values[si, sj, sk]
+
+    def pack_sparse_xp(self, xp, local_dim: str, coeff, name: str | None = None):
+        """pack_sparse in namespace ``xp`` (same summation order, so bitwise equal)."""
+        t = self.xp_tables(xp, False)
+        idx = t["sparse"][local_dim]
+        flat = coeff.reshape(-1, *coeff.shape[2:])
+        tail = (None,) * (coeff.ndim - 2)
+        _check_global_name(name, "sparse", local_dim)
+        zero = xp.zeros((), dtype=coeff.dtype)
+        out = 0
+        for r in range(idx.shape[-1]):
+            out = out + xp.where((idx[..., r] >= 0)[(..., *tail)], flat[xp.maximum(idx[..., r], 0)], zero)
+        centre, target = _GLOBAL_SPARSE_SIGNS.get(name, (False, False))
+        if centre and t["e_sign_raw"] is not None and local_dim.startswith("E"):
+            out = out * t["e_sign_raw"][(..., None, *tail)]
+        if target and local_dim in t["tsign"]:
+            out = out * t["tsign"][local_dim][(..., *tail)]
+        return xp.asfortranarray(out.astype(coeff.dtype, copy=False))
 
 
 _CACHED_GLOBAL_TABLES: GlobalPackTables | None = None
@@ -1549,6 +1642,7 @@ class GenericStructuredWrapper:
         if (
             os.environ.get("DACE_WARP_ALIGN", "1") != "0"
             and getattr(struct_np, "ndim", 0) in (3, 4)
+            and isinstance(struct_np, np.ndarray)  # the xp pack path (cupy) arrives already padded
         ):
             _a = np.asarray(struct_np)
             _ni = _a.shape[0]
@@ -1607,6 +1701,9 @@ class GenericStructuredWrapper:
     def _pack_argument(self, field, shift_i: int = 0, shift_j: int = 0, name: str | None = None):
         if not getattr(field, "domain", None):
             return field
+
+        if self.global_tables is not None and _use_xp_pack(field):
+            return self._pack_argument_xp(field, shift_i, shift_j, name)
 
         np_data = field.asnumpy()
 
@@ -1669,10 +1766,61 @@ class GenericStructuredWrapper:
 
         return field
 
+    def _xp_entity(self, field) -> tuple[str | None, bool]:
+        """(entity letter v/e/c or None, is_sparse_packed) of a field in global mode, from its dims only (no data access).
+
+        Mirrors the decisions of the host path: sparse-local fields with global tables are packed by pack_sparse; vertex
+        fields with a remap-table local dim are read-only coefficients (not unpacked)."""
+        dims = list(field.domain.dims)
+        local = getattr(dims[1], "value", None) if len(dims) >= 2 else None
+        if local is not None and local in _SPARSE_REMAP_TABLE and local in self.global_tables.sparse:
+            return None, True
+        for entity, x in (("Vertex", "v"), ("Edge", "e"), ("Cell", "c")):
+            if any(d.value == entity for d in dims):
+                return x, False
+        return None, False
+
+    def _pack_argument_xp(self, field, shift_i: int, shift_j: int, name: str | None):
+        """Global-mode pack in the field's own namespace (cupy on GPU: no host copy), values identical to the host path."""
+        data = field.ndarray
+        xp = cp if (cp is not None and isinstance(data, cp.ndarray)) else np
+        x, sparse = self._xp_entity(field)
+        dims = list(field.domain.dims)
+        if sparse:
+            struct = self.global_tables.pack_sparse_xp(xp, dims[1].value, data, name)
+            if shift_i > 0:
+                return gtx.as_field([IDim, JDim, Kolor, *dims[1:]], struct,
+                                    origin={IDim: shift_i, JDim: shift_j}, allocator=self.allocator)
+            return gtx.as_field([IDim, JDim, Kolor, *dims[1:]], struct, allocator=self.allocator)
+        if x is None:
+            return field
+        trailing_dims = dims[1:]
+        pad_i = os.environ.get("DACE_WARP_ALIGN", "1") != "0" and len(trailing_dims) <= 1
+        struct = self.global_tables.pack_xp(xp, data, x, name, pad_i)
+        return self._make_structured_field(
+            [IDim, JDim, Kolor, *trailing_dims], struct, trailing_dims, shift_i, shift_j,
+            trailing_starts=_trailing_starts(field),
+        )
+
+    def _unpack_to_buffer_xp(self, structured_field, original_unstructured_field):
+        x, sparse = self._xp_entity(original_unstructured_field)
+        if sparse or x is None:
+            return
+        dims = list(original_unstructured_field.domain.dims)
+        local = getattr(dims[1], "value", None) if len(dims) >= 2 else None
+        if x == "v" and local in _SPARSE_REMAP_TABLE:
+            return
+        struct = structured_field.ndarray
+        xp = cp if (cp is not None and isinstance(struct, cp.ndarray)) else np
+        orig = original_unstructured_field.ndarray
+        orig[...] = self.global_tables.unpack_xp(xp, struct, x)
+
     def _unpack_to_buffer(self, structured_field, original_unstructured_field):
         # print(f"unpacking field:", structured_field, "to", original_unstructured_field)
         if not getattr(original_unstructured_field, "domain", None):
             return
+        if self.global_tables is not None and _use_xp_pack(original_unstructured_field):
+            return self._unpack_to_buffer_xp(structured_field, original_unstructured_field)
 
         struct_np = structured_field.asnumpy()
         orig_array = original_unstructured_field.ndarray
@@ -1734,6 +1882,7 @@ class GenericStructuredWrapper:
             np.copyto(orig_array, unstruct_np)
     
     def __call__(self, *args, **kwargs):
+        _call_start = time.perf_counter()
         # Map positional args to kwargs using the program's declared param order.
         # This handles callers (like diffusion init_run) that pass some args positionally.
         if args:
@@ -1883,6 +2032,9 @@ class GenericStructuredWrapper:
                 import cupy as _cp  # GPU launches are async: sync so exec is not billed to unpack
 
                 _cp.cuda.runtime.deviceSynchronize()
+                _pool = _cp.get_default_memory_pool()
+                _POOL_PEAK[0] = max(_POOL_PEAK[0], _pool.used_bytes())
+                _POOL_PEAK[1] = max(_POOL_PEAK[1], _pool.total_bytes())
             _exec_end = time.perf_counter()
             _exec_elapsed = _exec_end - _exec_start
         finally:
@@ -1905,8 +2057,13 @@ class GenericStructuredWrapper:
         if _TIMING:
             if self._timing_calls > 0:
                 t = _TIMES.setdefault(
-                    self.operator_name, {"calls": 0, "pack": 0.0, "lookup": 0.0, "exec": 0.0, "unpack": 0.0})
+                    self.operator_name,
+                    {"calls": 0, "pack": 0.0, "lookup": 0.0, "exec": 0.0, "unpack": 0.0, "call": 0.0, "nfields": 0,
+                     "mbytes": 0.0})
                 t["calls"] += 1
+                t["call"] += time.perf_counter() - _call_start
+                t["nfields"] += len(packed_fields)
+                t["mbytes"] += sum(getattr(getattr(pf, "ndarray", None), "nbytes", 0) for _, pf in packed_fields) / 1e6
                 t["pack"] += _pack_elapsed
                 t["lookup"] += _lookup_elapsed
                 t["exec"] += _exec_elapsed
