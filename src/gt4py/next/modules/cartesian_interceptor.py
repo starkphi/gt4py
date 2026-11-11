@@ -48,6 +48,50 @@ _TIMES: dict = {}  # program -> {"calls", "pack", "lookup", "exec", "unpack", "c
 _POOL_PEAK = [0, 0]  # cupy default memory pool: max used_bytes, max total_bytes seen after exec (GPU only)
 
 
+# ---- B′ step 1: write-through mirror cache (agent_reports/2026-11-10_perf_design.md §2 B′, decided 2026-11-11) ----
+# A mirror is the packed structured field of an *input* argument, reused across calls while its unstructured source buffer U
+# is unchanged. Outputs are still packed fresh and unpacked into U after exec (U stays current: Python may read it any time);
+# unpacking into U drops every mirror whose source overlaps U's bytes (aliases such as a 2-D field and its 1-D view).
+# Not seen: writes to U outside the wrapper (Python, unwrapped programs). Hence the cache is only switched on by the driver
+# for the time loop (enable_mirror_cache), and GT4PY_GLOBAL_MIRROR_CHECK=1 repacks on every hit and compares bitwise.
+_MIRRORS: dict = {}  # key -> (structured field, source Field (strong ref: keeps the pointer from being reused), (lo, hi))
+_MIRROR_STATE = {"enabled": False, "check": os.environ.get("GT4PY_GLOBAL_MIRROR_CHECK", "0") == "1",
+                 "max": int(os.environ.get("GT4PY_GLOBAL_MIRROR_MAX", "1024"))}
+_MIRROR_STATS = {"hit": 0, "miss": 0, "evict": 0, "invalidated": 0, "check_fail": 0}
+
+
+def enable_mirror_cache(enabled: bool = True) -> None:
+    """Switch the input mirror cache on/off (global mode, cupy fields). Always starts/ends with an empty cache."""
+    _MIRRORS.clear()
+    _MIRROR_STATE["enabled"] = bool(enabled)
+
+
+def invalidate_mirrors() -> None:
+    """Drop all mirrors (call after writing unstructured fields outside the structured programs)."""
+    _MIRROR_STATS["invalidated"] += len(_MIRRORS)
+    _MIRRORS.clear()
+
+
+def _byte_range(arr) -> tuple[int, int]:
+    lo = hi = int(arr.data.ptr)
+    for n, st in zip(arr.shape, arr.strides):
+        if n == 0:
+            return lo, lo
+        if st < 0:
+            lo += (n - 1) * st
+        else:
+            hi += (n - 1) * st
+    return lo, hi + arr.itemsize
+
+
+def _invalidate_overlapping(arr) -> None:
+    lo, hi = _byte_range(arr)
+    dead = [k for k, (_, _, (a, b)) in _MIRRORS.items() if a < hi and lo < b]
+    for k in dead:
+        del _MIRRORS[k]
+    _MIRROR_STATS["invalidated"] += len(dead)
+
+
 def _use_xp_pack(field) -> bool:
     """Global mode: pack/unpack cupy fields on the device instead of via host numpy.
 
@@ -84,6 +128,8 @@ def _report_timing() -> None:
               f" {_other(t):8.3f} {t['call']:9.3f} {t['nfields'] / n:8.1f} {t['mbytes'] / n:8.1f}")
     print(f"{'TOTAL':55s} {tot['calls']:6d} {tot['pack']:9.3f} {tot['lookup']:9.3f} {tot['exec']:9.3f} {tot['unpack']:9.3f}"
           f" {_other(tot):8.3f} {tot['call']:9.3f} {tot['nfields']:8d} {tot['mbytes']:8.0f}")
+    if any(_MIRROR_STATS.values()):
+        print(f"mirror cache: {_MIRROR_STATS}, entries at exit {len(_MIRRORS)}")
     if _POOL_PEAK[1]:
         print(f"cupy pool peak after exec: used {_POOL_PEAK[0] / 2**30:.2f} GiB, held {_POOL_PEAK[1] / 2**30:.2f} GiB")
     by_kind: dict = {}
@@ -1766,6 +1812,85 @@ class GenericStructuredWrapper:
 
         return field
 
+    def _output_names(self) -> frozenset | None:
+        """Program parameters written by any call of the PAST body (``out=``), or None if not determinable."""
+        if "_out_names" not in self.__dict__:
+            names = None
+            try:
+                from gt4py.next.ffront import program_ast as past
+
+                found: set[str] = set()
+
+                def _collect(e) -> bool:
+                    if isinstance(e, past.TupleExpr):
+                        return all(_collect(x) for x in e.elts)
+                    if isinstance(e, past.Name):
+                        found.add(str(e.id))
+                        return True
+                    if isinstance(e, past.Subscript) and isinstance(e.value, past.Name):
+                        found.add(str(e.value.id))
+                        return True
+                    return False
+
+                body = self._operator.past_stage.past_node.body
+                ok = True
+                for call in body:
+                    out_expr = call.kwargs.get("out")
+                    if out_expr is None or not _collect(out_expr):
+                        ok = False
+                if ok and found:
+                    names = frozenset(found)
+            except Exception:
+                names = None
+            self._out_names = names
+            if names is None and self.global_tables is not None:
+                print(f"[mirror cache] {getattr(self, 'operator_name', '?')}: outputs not determinable from the PAST, "
+                      "no mirrors for this program (all arguments packed and unpacked)", flush=True)
+        return self._out_names
+
+    def _pack_cached(self, field, shift_i: int, shift_j: int, name: str, is_output: bool):
+        """_pack_argument with the B′ mirror cache for inputs (global mode, cupy fields, cache enabled)."""
+        if (
+            is_output
+            or not _MIRROR_STATE["enabled"]
+            or self.global_tables is None
+            or not getattr(field, "domain", None)
+            or not _use_xp_pack(field)
+        ):
+            return self._pack_argument(field, shift_i, shift_j, name)
+        x, sparse = self._xp_entity(field)
+        if x is None and not sparse:
+            return field
+        arr = field.ndarray
+        if sparse:
+            sign_class = ("sparse", _GLOBAL_SPARSE_SIGNS.get(name))
+        elif x == "e":
+            sign_class = ("e", self.global_tables.edge_sign_for(name) is not None)
+        else:
+            sign_class = (x,)
+        dom = tuple((str(d.value), int(r.start), int(r.stop)) for d, r in zip(field.domain.dims, field.domain.ranges))
+        key = (int(arr.data.ptr), arr.shape, arr.strides, arr.dtype.str, dom, sign_class, shift_i, shift_j)
+        hit = _MIRRORS.get(key)
+        if hit is not None:
+            _MIRROR_STATS["hit"] += 1
+            if _MIRROR_STATE["check"]:
+                fresh = self._pack_argument(field, shift_i, shift_j, name)
+                if not (fresh.ndarray.shape == hit[0].ndarray.shape
+                        and bool(cp.array_equal(fresh.ndarray, hit[0].ndarray, equal_nan=True))):
+                    _MIRROR_STATS["check_fail"] += 1
+                    print(f"[MIRROR CHECK FAIL] {self.operator_name}.{name}: cached mirror differs from a fresh pack "
+                          "(source written outside the structured programs)", flush=True)
+                    _MIRRORS[key] = (fresh, field, hit[2])
+                    return fresh
+            return hit[0]
+        _MIRROR_STATS["miss"] += 1
+        packed = self._pack_argument(field, shift_i, shift_j, name)
+        if len(_MIRRORS) >= _MIRROR_STATE["max"]:
+            del _MIRRORS[next(iter(_MIRRORS))]
+            _MIRROR_STATS["evict"] += 1
+        _MIRRORS[key] = (packed, field, _byte_range(arr))
+        return packed
+
     def _xp_entity(self, field) -> tuple[str | None, bool]:
         """(entity letter v/e/c or None, is_sparse_packed) of a field in global mode, from its dims only (no data access).
 
@@ -1939,6 +2064,9 @@ class GenericStructuredWrapper:
 
         structured_kwargs = {}
         packed_fields: list[tuple[object, object]] = []
+        packed_names: list[str] = []
+        _outs = self._output_names()
+        _mirrors_on = _MIRROR_STATE["enabled"] and _outs is not None
 
         _pack_start = time.perf_counter()
         for arg_name, arg_val in kwargs.items():
@@ -1946,17 +2074,22 @@ class GenericStructuredWrapper:
                 continue
             _t_arg = time.perf_counter()
             if isinstance(arg_val, tuple):
-                packed_tuple = tuple(self._pack_argument(f, _pack_shift_i, _pack_shift_j, arg_name) for f in arg_val)
+                packed_tuple = tuple(
+                    self._pack_cached(f, _pack_shift_i, _pack_shift_j, arg_name, not _mirrors_on or arg_name in _outs)
+                    for f in arg_val)
                 structured_kwargs[arg_name] = packed_tuple
                 for original_field, packed_field in zip(arg_val, packed_tuple, strict=False):
                     if getattr(original_field, "domain", None) is not None:
                         packed_fields.append((original_field, packed_field))
+                        packed_names.append(arg_name)
             else:
                 # print(f"Packing argument '{arg_name}' for operator '{self.operator_name}'")
-                packed_arg = self._pack_argument(arg_val, _pack_shift_i, _pack_shift_j, arg_name)
+                packed_arg = self._pack_cached(
+                    arg_val, _pack_shift_i, _pack_shift_j, arg_name, not _mirrors_on or arg_name in _outs)
                 structured_kwargs[arg_name] = packed_arg
                 if getattr(arg_val, "domain", None) is not None:
                     packed_fields.append((arg_val, packed_arg))
+                    packed_names.append(arg_name)
             if _TIMING and self._timing_calls > 0:
                 _first = arg_val[0] if isinstance(arg_val, tuple) and arg_val else arg_val
                 _add_arg_time(self.operator_name, arg_name, "pack", _first, time.perf_counter() - _t_arg)
@@ -2048,8 +2181,12 @@ class GenericStructuredWrapper:
             if _TIMING else None
         )
         for _k, (original_field, packed_field) in enumerate(packed_fields):
+            if _mirrors_on and packed_names[_k] not in _outs:
+                continue  # inputs: unpacking would rewrite identical owned values
             _t_arg = time.perf_counter()
             self._unpack_to_buffer(packed_field, original_field)
+            if _MIRROR_STATE["enabled"] and cp is not None and isinstance(getattr(original_field, "ndarray", None), cp.ndarray):
+                _invalidate_overlapping(original_field.ndarray)  # also when outputs are unknown (all args unpacked)
             if _TIMING and self._timing_calls > 0:
                 _add_arg_time(self.operator_name, _arg_names[_k], "unpack", original_field, time.perf_counter() - _t_arg)
         _unpack_end = time.perf_counter()
