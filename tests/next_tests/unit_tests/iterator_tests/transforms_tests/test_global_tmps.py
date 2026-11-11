@@ -22,6 +22,7 @@ from gt4py.next.iterator.type_system import inference as type_inference
 from gt4py.next.type_system import type_specifications as ts
 from gt4py.next.iterator.ir_utils import (
     ir_makers as im,
+    common_pattern_matcher as cpm,
     misc as ir_utils_misc,
 )
 
@@ -578,3 +579,106 @@ def test_non_scan_projector(uids: utils.IDGeneratorPool):
 
     actual = global_tmps.create_global_tmps(testee, offset_provider, uids=uids)
     assert actual == testee
+
+
+def _assert_writes_within_targets(program: itir.Program, target_domains: dict[str, itir.FunCall]):
+    """Assert that every `SetAt` writes exactly the domain its target was allocated / requested on."""
+    target_domains = {
+        **target_domains,
+        **{decl.id: decl.domain for decl in program.declarations},
+    }
+
+    def check(stmts):
+        for stmt in stmts:
+            if isinstance(stmt, itir.IfStmt):
+                check(stmt.true_branch)
+                check(stmt.false_branch)
+                continue
+            targets = (
+                stmt.target.args if cpm.is_call_to(stmt.target, "make_tuple") else [stmt.target]
+            )
+            for target in targets:
+                assert isinstance(target, itir.SymRef)
+                assert stmt.domain == target_domains[str(target.id)], (
+                    f"'{target.id}' written on {stmt.domain}, "
+                    f"but allocated / requested on {target_domains[str(target.id)]}."
+                )
+
+    check(program.body)
+
+
+def _if_branch_program(body_expr: itir.Expr, outs: list[str], domain: itir.FunCall):
+    ik_field_type = ts.FieldType(dims=[IDim, KDim], dtype=float_type)
+    return program_factory(
+        params=[
+            im.sym("cond", ts.ScalarType(kind=ts.ScalarKind.BOOL)),
+            im.sym("inp", ik_field_type),
+            *(im.sym(out, ik_field_type) for out in outs),
+        ],
+        body=[
+            itir.SetAt(
+                target=im.make_tuple(*outs) if len(outs) > 1 else im.ref(outs[0]),
+                expr=body_expr,
+                domain=domain,
+            )
+        ],
+    )
+
+
+def test_if_branch_reused_at_shifted_position(uids: utils.IDGeneratorPool):
+    # Corresponds to the field operator
+    #   w = inp * 2.0
+    #   w2 = w
+    #   if cond:
+    #       w2 = w
+    #   return w2, w(KDim + 1)
+    # `w` is needed on K [0, 36), the `if_` (and its temporary) only on K [0, 35). Both branches
+    # must write K [0, 35) only.
+    domain = im.domain("cartesian_domain", {IDim: (0, 4), KDim: (0, 35)})
+    Koff = im.cartesian_offset(KDim, KDim)
+    testee = _if_branch_program(
+        im.let("w", im.as_fieldop(im.lambda_("x")(im.multiplies_(im.deref("x"), 2.0)))("inp"))(
+            im.make_tuple(
+                im.if_("cond", "w", "w"),
+                im.as_fieldop(im.lambda_("x")(im.deref(im.shift(Koff, 1)("x"))))("w"),
+            )
+        ),
+        ["out0", "out1"],
+        domain,
+    )
+    testee = type_inference.infer(testee, offset_provider_type={})
+    testee = infer_domain.infer_program(testee, offset_provider={})
+
+    actual = global_tmps.create_global_tmps(testee, {}, uids=uids)
+
+    _assert_writes_within_targets(actual, {"out0": domain, "out1": domain})
+
+
+def test_tuple_if_branch_reused_at_shifted_position(uids: utils.IDGeneratorPool):
+    # Same as `test_if_branch_reused_at_shifted_position`, but with a tuple-valued `if_` whose
+    # branches are a tuple temporary that is also read shifted.
+    domain = im.domain("cartesian_domain", {IDim: (0, 4), KDim: (0, 35)})
+    Koff = im.cartesian_offset(KDim, KDim)
+    testee = _if_branch_program(
+        im.let(
+            "t", im.as_fieldop(im.lambda_("x")(im.make_tuple(im.deref("x"), im.deref("x"))))("inp")
+        )(
+            im.let("t2", im.if_("cond", "t", "t"))(
+                im.make_tuple(
+                    im.tuple_get(0, "t2"),
+                    im.tuple_get(1, "t2"),
+                    im.as_fieldop(im.lambda_("x")(im.deref(im.shift(Koff, 1)("x"))))(
+                        im.tuple_get(0, "t")
+                    ),
+                )
+            )
+        ),
+        ["out0", "out1", "out2"],
+        domain,
+    )
+    testee = type_inference.infer(testee, offset_provider_type={})
+    testee = infer_domain.infer_program(testee, offset_provider={})
+
+    actual = global_tmps.create_global_tmps(testee, {}, uids=uids)
+
+    _assert_writes_within_targets(actual, {"out0": domain, "out1": domain, "out2": domain})
