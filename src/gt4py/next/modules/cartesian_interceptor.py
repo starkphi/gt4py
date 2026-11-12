@@ -48,16 +48,18 @@ _TIMES: dict = {}  # program -> {"calls", "pack", "lookup", "exec", "unpack", "c
 _POOL_PEAK = [0, 0]  # cupy default memory pool: max used_bytes, max total_bytes seen after exec (GPU only)
 
 
-# ---- B′ step 1: write-through mirror cache (agent_reports/2026-11-10_perf_design.md §2 B′, decided 2026-11-11) ----
+# ---- B′ steps 1+2: write-through mirror cache (agent_reports/2026-11-10_perf_design.md §2 B′, decided 2026-11-11) ----
 # A mirror is the packed structured field of an *input* argument, reused across calls while its unstructured source buffer U
 # is unchanged. Outputs are still packed fresh and unpacked into U after exec (U stays current: Python may read it any time);
 # unpacking into U drops every mirror whose source overlaps U's bytes (aliases such as a 2-D field and its 1-D view).
 # Not seen: writes to U outside the wrapper (Python, unwrapped programs). Hence the cache is only switched on by the driver
 # for the time loop (enable_mirror_cache), and GT4PY_GLOBAL_MIRROR_CHECK=1 repacks on every hit and compares bitwise.
+# Step 2: after unpack, an output's frame gets its halo/dummy slots refreshed (GlobalPackTables.refresh_halo_xp) and is kept
+# as the mirror of its U, so the next reader of U hits instead of re-gathering (opt out: GT4PY_GLOBAL_OUT_MIRRORS=0).
 _MIRRORS: dict = {}  # key -> (structured field, source Field (strong ref: keeps the pointer from being reused), (lo, hi))
 _MIRROR_STATE = {"enabled": False, "check": os.environ.get("GT4PY_GLOBAL_MIRROR_CHECK", "0") == "1",
                  "max": int(os.environ.get("GT4PY_GLOBAL_MIRROR_MAX", "1024"))}
-_MIRROR_STATS = {"hit": 0, "miss": 0, "evict": 0, "invalidated": 0, "check_fail": 0}
+_MIRROR_STATS = {"hit": 0, "miss": 0, "evict": 0, "invalidated": 0, "check_fail": 0, "out_kept": 0}
 
 
 def enable_mirror_cache(enabled: bool = True) -> None:
@@ -777,6 +779,44 @@ class GlobalPackTables:
         """Owned slots of ``struct_values`` [I(+pad), J, Kolor, *tail] as [n_entity, *tail], in namespace ``xp``."""
         si, sj, sk = self.xp_tables(xp, False)["slots"][x]
         return struct_values[si, sj, sk]
+
+    def halo_tables_xp(self, xp, x: str, pad_i: bool) -> dict:
+        """Index tables of refresh_halo_xp, cached: halo slots (valid, not owned) with their owner slot and seam sign,
+        and dummy slots (gather -1, incl. the IDim pad rows when ``pad_i``)."""
+        key = (xp.__name__, x, pad_i)
+        cache = self.__dict__.setdefault("_halo_cache", {})
+        if key not in cache:
+            g = self.gather[x]
+            owned = np.zeros(g.shape, dtype=bool)
+            sl = self.slots[x]
+            owned[sl[:, 0], sl[:, 1], sl[:, 2]] = True
+            hi, hj, hk = np.nonzero((g >= 0) & ~owned)
+            own = sl[g[hi, hj, hk]]
+            ni32 = ((g.shape[0] + 31) // 32) * 32 if pad_i else g.shape[0]
+            gp = np.full((ni32, *g.shape[1:]), -1, dtype=g.dtype)
+            gp[: g.shape[0]] = g
+            di, dj, dk = np.nonzero(gp < 0)
+            to = lambda a: xp.asarray(a.astype(np.int64))  # noqa: E731
+            cache[key] = {
+                "halo": (to(hi), to(hj), to(hk)),
+                "owner": (to(own[:, 0]), to(own[:, 1]), to(own[:, 2])),
+                "sign": None if (x != "e" or self.e_sign is None) else xp.asarray(self.e_sign[hi, hj, hk]),
+                "dummy": (to(di), to(dj), to(dk)),
+            }
+        return cache[key]
+
+    def refresh_halo_xp(self, xp, struct_values, x: str, sign_name: str | None, pad_i: bool) -> None:
+        """In place: halo slots := (seam sign *) owner-slot value, dummy slots := 0 (B′ step 2: output mirrors).
+
+        After this, a frame whose owned slots hold the values of U equals pack_xp(U) bitwise (owned slots carry sign +1),
+        so it can serve as the input mirror of U without a fresh gather."""
+        t = self.halo_tables_xp(xp, x, pad_i)
+        tail = (None,) * (struct_values.ndim - 3)
+        vals = struct_values[t["owner"]]
+        if t["sign"] is not None and self.edge_sign_for(sign_name) is not None:
+            vals = vals * t["sign"][(..., *tail)].astype(struct_values.dtype)
+        struct_values[t["halo"]] = vals.astype(struct_values.dtype, copy=False)
+        struct_values[t["dummy"]] = 0
 
     def pack_sparse_xp(self, xp, local_dim: str, coeff, name: str | None = None):
         """pack_sparse in namespace ``xp`` (same summation order, so bitwise equal)."""
@@ -1862,14 +1902,7 @@ class GenericStructuredWrapper:
         if x is None and not sparse:
             return field
         arr = field.ndarray
-        if sparse:
-            sign_class = ("sparse", _GLOBAL_SPARSE_SIGNS.get(name))
-        elif x == "e":
-            sign_class = ("e", self.global_tables.edge_sign_for(name) is not None)
-        else:
-            sign_class = (x,)
-        dom = tuple((str(d.value), int(r.start), int(r.stop)) for d, r in zip(field.domain.dims, field.domain.ranges))
-        key = (int(arr.data.ptr), arr.shape, arr.strides, arr.dtype.str, dom, sign_class, shift_i, shift_j)
+        key = self._mirror_key(field, x, sparse, name, shift_i, shift_j)
         hit = _MIRRORS.get(key)
         if hit is not None:
             _MIRROR_STATS["hit"] += 1
@@ -1890,6 +1923,42 @@ class GenericStructuredWrapper:
             _MIRROR_STATS["evict"] += 1
         _MIRRORS[key] = (packed, field, _byte_range(arr))
         return packed
+
+    def _mirror_key(self, field, x, sparse: bool, name: str | None, shift_i: int, shift_j: int) -> tuple:
+        arr = field.ndarray
+        if sparse:
+            sign_class = ("sparse", _GLOBAL_SPARSE_SIGNS.get(name))
+        elif x == "e":
+            sign_class = ("e", self.global_tables.edge_sign_for(name) is not None)
+        else:
+            sign_class = (x,)
+        dom = tuple((str(d.value), int(r.start), int(r.stop)) for d, r in zip(field.domain.dims, field.domain.ranges))
+        return (int(arr.data.ptr), arr.shape, arr.strides, arr.dtype.str, dom, sign_class, shift_i, shift_j)
+
+    def _keep_output_mirrors(self, cands: list, shift_i: int, shift_j: int) -> None:
+        """B′ step 2: after unpack, turn each output's structured frame into the mirror of its (now current) source U.
+
+        Skipped for outputs whose U overlaps another output of the same call (the later unpack may overwrite part of U)
+        and for env opt-out GT4PY_GLOBAL_OUT_MIRRORS=0."""
+        if os.environ.get("GT4PY_GLOBAL_OUT_MIRRORS", "1") == "0":
+            return
+        ranges = [_byte_range(f.ndarray) for f, _, _ in cands]
+        for n, (field, packed, name) in enumerate(cands):
+            lo, hi = ranges[n]
+            if any(a < hi and lo < b for m, (a, b) in enumerate(ranges) if m != n):
+                continue
+            x, sparse = self._xp_entity(field)
+            dims = list(field.domain.dims)
+            local = getattr(dims[1], "value", None) if len(dims) >= 2 else None
+            if sparse or x is None or (x == "v" and local in _SPARSE_REMAP_TABLE):
+                continue
+            pad_i = os.environ.get("DACE_WARP_ALIGN", "1") != "0" and len(dims) <= 2
+            self.global_tables.refresh_halo_xp(cp, packed.ndarray, x, name, pad_i)
+            if len(_MIRRORS) >= _MIRROR_STATE["max"]:
+                del _MIRRORS[next(iter(_MIRRORS))]
+                _MIRROR_STATS["evict"] += 1
+            _MIRRORS[self._mirror_key(field, x, False, name, shift_i, shift_j)] = (packed, field, (lo, hi))
+            _MIRROR_STATS["out_kept"] += 1
 
     def _xp_entity(self, field) -> tuple[str | None, bool]:
         """(entity letter v/e/c or None, is_sparse_packed) of a field in global mode, from its dims only (no data access).
@@ -2180,6 +2249,7 @@ class GenericStructuredWrapper:
              if getattr(f, "domain", None) is not None]
             if _TIMING else None
         )
+        _out_cands = []
         for _k, (original_field, packed_field) in enumerate(packed_fields):
             if _mirrors_on and packed_names[_k] not in _outs:
                 continue  # inputs: unpacking would rewrite identical owned values
@@ -2187,8 +2257,12 @@ class GenericStructuredWrapper:
             self._unpack_to_buffer(packed_field, original_field)
             if _MIRROR_STATE["enabled"] and cp is not None and isinstance(getattr(original_field, "ndarray", None), cp.ndarray):
                 _invalidate_overlapping(original_field.ndarray)  # also when outputs are unknown (all args unpacked)
+                if _mirrors_on and _use_xp_pack(original_field) and packed_field is not original_field:
+                    _out_cands.append((original_field, packed_field, packed_names[_k]))
             if _TIMING and self._timing_calls > 0:
                 _add_arg_time(self.operator_name, _arg_names[_k], "unpack", original_field, time.perf_counter() - _t_arg)
+        if _out_cands:
+            self._keep_output_mirrors(_out_cands, _pack_shift_i, _pack_shift_j)
         _unpack_end = time.perf_counter()
         _unpack_elapsed = _unpack_end - _unpack_start
         if _TIMING:
