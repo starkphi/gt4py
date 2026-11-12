@@ -809,7 +809,17 @@ class GlobalPackTables:
         """In place: halo slots := (seam sign *) owner-slot value, dummy slots := 0 (B′ step 2: output mirrors).
 
         After this, a frame whose owned slots hold the values of U equals pack_xp(U) bitwise (owned slots carry sign +1),
-        so it can serve as the input mirror of U without a fresh gather."""
+        so it can serve as the input mirror of U without a fresh gather. cupy frames with at most one trailing dim use one
+        fused kernel on precomputed element offsets (_refresh_halo_kernel); otherwise (numpy, 2+ trailing dims) fancy
+        indexing. GT4PY_GLOBAL_REFRESH_KERNEL=0 forces the fancy-indexing path (A/B)."""
+        if (
+            cp is not None
+            and xp is cp
+            and struct_values.ndim <= 4
+            and (struct_values.flags.c_contiguous or struct_values.flags.f_contiguous)
+            and os.environ.get("GT4PY_GLOBAL_REFRESH_KERNEL", "1") != "0"
+        ):
+            return self._refresh_halo_kernel(struct_values, x, sign_name, pad_i)
         t = self.halo_tables_xp(xp, x, pad_i)
         tail = (None,) * (struct_values.ndim - 3)
         vals = struct_values[t["owner"]]
@@ -817,6 +827,38 @@ class GlobalPackTables:
             vals = vals * t["sign"][(..., *tail)].astype(struct_values.dtype)
         struct_values[t["halo"]] = vals.astype(struct_values.dtype, copy=False)
         struct_values[t["dummy"]] = 0
+
+    def _refresh_offsets(self, x: str, pad_i: bool, hstrides: tuple[int, int, int]) -> tuple:
+        """(dst, src, sign) device arrays for _refresh_halo_kernel, cached per frame strides (in elements).
+
+        dst: horizontal element offset of every halo slot, then every dummy slot; src: owner-slot offset, -1 for dummies;
+        sign: e_sign at the halo slot (1.0 for dummies / non-edge entities)."""
+        key = (x, pad_i, hstrides)
+        cache = self.__dict__.setdefault("_refresh_cache", {})
+        if key not in cache:
+            t = self.halo_tables_xp(np, x, pad_i)
+            off = lambda ijk: sum(a.astype(np.int64) * st for a, st in zip(ijk, hstrides))  # noqa: E731
+            dst = np.concatenate([off(t["halo"]), off(t["dummy"])])
+            src = np.concatenate([off(t["owner"]), -np.ones(t["dummy"][0].shape[0], dtype=np.int64)])
+            sign = np.ones(dst.shape[0], dtype=np.float64)
+            if t["sign"] is not None:
+                sign[: t["halo"][0].shape[0]] = t["sign"]
+            cache[key] = (cp.asarray(dst), cp.asarray(src), cp.asarray(sign))
+        return cache[key]
+
+    def _refresh_halo_kernel(self, struct_values, x: str, sign_name: str | None, pad_i: bool) -> None:
+        # A raw cupy array is indexed by its C-order linear index (mapped through its strides), so the offsets below are
+        # memory offsets only for a C-contiguous array: an F-contiguous frame (the packed layout) goes in as its
+        # transpose, which is C-contiguous over the same memory. Offsets are in elements.
+        item = struct_values.itemsize
+        est = [st // item for st in struct_values.strides]
+        dst, src, sign = self._refresh_offsets(x, pad_i, tuple(est[:3]))
+        nt, tst = (struct_values.shape[3], est[3]) if struct_values.ndim == 4 else (1, 0)
+        use_sign = int(x == "e" and self.e_sign is not None and self.edge_sign_for(sign_name) is not None)
+        flat = struct_values if struct_values.flags.c_contiguous else struct_values.T
+        if dst.shape[0] * nt:
+            _refresh_kernel()(dst, src, sign, np.int64(dst.shape[0]), np.int64(tst), np.int32(use_sign), flat,
+                              size=dst.shape[0] * nt)
 
     def pack_sparse_xp(self, xp, local_dim: str, coeff, name: str | None = None):
         """pack_sparse in namespace ``xp`` (same summation order, so bitwise equal)."""
@@ -835,6 +877,34 @@ class GlobalPackTables:
         if target and local_dim in t["tsign"]:
             out = out * t["tsign"][local_dim][(..., *tail)]
         return xp.asfortranarray(out.astype(coeff.dtype, copy=False))
+
+
+_REFRESH_KERNEL = None
+
+
+def _refresh_kernel():
+    """cupy kernel of GlobalPackTables._refresh_halo_kernel: one thread per (refresh slot e, trailing index t).
+
+    Sources are owned slots and never written here, destinations are halo/dummy slots: no read/write race.
+    The sign multiply matches pack_xp (value * T(sign), sign = +-1), so the result is bitwise equal to a fresh pack."""
+    global _REFRESH_KERNEL
+    if _REFRESH_KERNEL is None:
+        _REFRESH_KERNEL = cp.ElementwiseKernel(
+            "raw int64 dst, raw int64 src, raw float64 sgn, int64 n, int64 tst, int32 use_sign",
+            "raw T P",  # out param: raw inputs are const in an ElementwiseKernel
+            """
+            const long long e = i % n, t = i / n;
+            const long long s = src[e];
+            T v = T(0);
+            if (s >= 0) {
+                v = P[s + t * tst];
+                if (use_sign) v = v * T(sgn[e]);
+            }
+            P[dst[e] + t * tst] = v;
+            """,
+            "structured_refresh_halo",
+        )
+    return _REFRESH_KERNEL
 
 
 _CACHED_GLOBAL_TABLES: GlobalPackTables | None = None
