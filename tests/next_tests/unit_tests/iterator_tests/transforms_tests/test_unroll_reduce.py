@@ -7,12 +7,10 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import pytest
-import copy
 
 from gt4py.next import common, utils
 from gt4py.next.iterator import ir
 from gt4py.next.iterator.ir_utils import ir_makers as im
-from gt4py.next.iterator.transforms.remap_symbols import RemapSymbolRefs
 from gt4py.next.iterator.transforms.unroll_reduce import UnrollReduce, _get_partial_offset_tags
 from gt4py.next.type_system import type_specifications as ts
 
@@ -92,7 +90,7 @@ def test_get_partial_offsets(reduction, request):
 
 
 def _expected(red, max_neighbors, has_skip_values, shifted_arg=0):
-    acc, offset = "_acc_0", "_i_0"
+    acc, offset, step = "_acc_0", "_i_0", "_step_0"
 
     red_fun, red_init = red.fun.args
 
@@ -105,15 +103,13 @@ def _expected(red, max_neighbors, has_skip_values, shifted_arg=0):
         can_deref = im.can_deref(im.shift(neighbors_offset, offset)(neighbors_it))
 
         step_expr = im.if_(can_deref, step_expr, acc)
+    step_fun = im.lambda_(acc, offset)(step_expr)
 
     step_app = red_init
     for i in range(max_neighbors):
-        step_app = RemapSymbolRefs().visit(
-            copy.deepcopy(step_expr),
-            symbol_map={acc: copy.deepcopy(step_app), offset: ir.OffsetLiteral(value=i)},
-        )
+        step_app = im.call(step)(step_app, ir.OffsetLiteral(value=i))
 
-    return step_app
+    return im.let(step, step_fun)(step_app)
 
 
 def test_basic(basic_reduction, has_skip_values, uids: utils.IDGeneratorPool):
