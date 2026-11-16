@@ -1162,11 +1162,16 @@ class GenericStructuredWrapper:
                 otf_workflow__bare_translation__symbolic_domain_sizes=sds,
             )
         else:
-            structured_backend = self._backend_factory(
-                cached=True,
-                otf_workflow__cached_translation=False,
-                otf_workflow__bare_translation__symbolic_domain_sizes=sds,
-                gpu=self._use_gpu,
+            # merge-test-main: upstream replaced the factory-boy `GTFNBackendFactory` by toolchain builders
+            # (#2808). `self._backend_factory` is ignored on the gtfn path; sds travels in the translation step.
+            from gt4py.next.program_processors.runners import gtfn as _gtfn_runner
+
+            structured_backend = _gtfn_runner.make_gtfn_toolchain(
+                _gtfn_runner.GTFNConfig(gpu=self._use_gpu, cached_translation=False),
+                name_postfix="_structured",
+                translation=functools.partial(
+                    _gtfn_runner.make_gtfn_translation, symbolic_domain_sizes=sds
+                ),
             )
         # Store sds so __call__ can re-set the ContextVar at DaCe pool-thread compile time.
         self._sds_cache[cache_key] = sds

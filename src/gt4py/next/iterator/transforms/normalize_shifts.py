@@ -24,6 +24,9 @@ class NormalizeShifts(PreserveLocationVisitor, NodeTranslator):
 
     @staticmethod
     def _is_implicit_off_axis(expr: ir.Expr) -> bool:
+        if isinstance(expr, ir.CartesianOffset):
+            # merge-test-main: Cartesian shifts are `CartesianOffset` nodes since upstream #2411
+            return expr.domain == expr.codomain
         if isinstance(expr, ir.OffsetLiteral):
             return isinstance(expr.value, str) and expr.value.startswith(
                 NormalizeShifts._IMPLICIT_OFF_AXIS_PREFIX

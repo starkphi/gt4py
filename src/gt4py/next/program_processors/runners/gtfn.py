@@ -17,7 +17,7 @@ from typing import TypeAlias
 import numpy as np
 
 import gt4py._core.definitions as core_defs
-from gt4py.next import backend, common, field_utils
+from gt4py.next import backend, common, config, field_utils
 from gt4py.next.embedded import nd_array_field
 from gt4py.next.instrumentation import metrics
 from gt4py.next.iterator import ir as itir
@@ -96,7 +96,7 @@ def convert_args(
 def extract_connectivity_args(
     offset_provider: dict[str, common.Connectivity | common.Dimension],
     device: core_defs.DeviceType,
-    inp: stages.ExecutableProgram | None = None,
+    inp: artifacts.ExecutableProgram | None = None,
 ) -> list[tuple[core_defs.NDArrayObject, tuple[int, ...]]]:
     # Note: this function is on the hot path and needs to have minimal overhead.
     zero_origin = (0, 0)
@@ -150,7 +150,7 @@ def _extract_required_connectivity_names_from_doc(doc: str) -> tuple[str, ...]:
 _CONNECTIVITY_DOC_MARKER = "gt4py_connectivities:"
 
 
-def _connectivity_names_from_binding_doc(inp: stages.ExecutableProgram) -> tuple[str, ...] | None:
+def _connectivity_names_from_binding_doc(inp: artifacts.ExecutableProgram) -> tuple[str, ...] | None:
     """Exact neighbor-table list written into the binding docstring by `nanobind.create_bindings`
     (may be empty). None if the binding predates the marker."""
     for candidate in (inp, *(getattr(inp, a, None) for a in ("func", "__wrapped__"))):
@@ -162,7 +162,7 @@ def _connectivity_names_from_binding_doc(inp: stages.ExecutableProgram) -> tuple
     return None
 
 
-def _extract_required_connectivity_names(inp: stages.ExecutableProgram | None) -> tuple[str, ...]:
+def _extract_required_connectivity_names(inp: artifacts.ExecutableProgram | None) -> tuple[str, ...]:
     if inp is None:
         return ()
 

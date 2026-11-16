@@ -255,11 +255,15 @@ def _derive_entity_range_bounds_from_mapping(
 # =====================================================================
 
 def _apply_shift_chain(arg: ir.Expr, shift_spec: tuple[ir.OffsetLiteral, ...]) -> ir.Expr:
-    normalized: list[ir.OffsetLiteral] = []
+    # merge-test-main: upstream (#2411) removed the implicit "_Off<Dim>" string offsets; a Cartesian shift is
+    # now `shift(CartesianOffset(domain=dim, codomain=dim), n)`.
+    normalized: list[ir.Expr] = []
     for idx, off in enumerate(shift_spec):
         if idx % 2 == 0 and isinstance(off.value, str) and off.value in _STRUCTURED_HORIZONTAL_AXES:
             normalized.append(
-                ir.OffsetLiteral(value=common.dimension_to_implicit_offset(off.value))
+                im.cartesian_offset(
+                    common.Dimension(off.value, kind=common.DimensionKind.HORIZONTAL)
+                )
             )
         else:
             normalized.append(off)
@@ -345,14 +349,17 @@ def _build_field_concat_where_from_branches(
         return None
 
     def _kolor_shift(shift_spec: tuple[ir.OffsetLiteral, ...]) -> int:
-        kolor_axis_tags = {common.dimension_to_implicit_offset("Kolor"), "Kolor"}
+        kolor_axis_tags = {"Kolor"}
         for idx in range(0, len(shift_spec), 2):
             if idx + 1 >= len(shift_spec):
                 break
             axis_lit = shift_spec[idx]
             off_lit = shift_spec[idx + 1]
+            axis_name = (
+                axis_lit.domain.value if isinstance(axis_lit, ir.CartesianOffset) else axis_lit.value
+            )
             if (
-                isinstance(axis_lit, ir.OffsetLiteral) and axis_lit.value in kolor_axis_tags
+                axis_name in kolor_axis_tags
                 and isinstance(off_lit, ir.OffsetLiteral) and isinstance(off_lit.value, int)
             ):
                 return int(off_lit.value)
@@ -2648,7 +2655,7 @@ class NeighborReductionUnroller(NodeTranslator):
                                 current_kolor=ck,
                             )
 
-                if isinstance(stencil.expr, ir.FunCall) and cpm.is_call_to(stencil.expr.fun, "map_"):
+                if isinstance(stencil.expr, ir.FunCall) and cpm.is_call_to(stencil.expr.fun, ("map_", "map_list")):
                     mapped_op = stencil.expr.fun.args[0]
                     new_args = []
                     for arg in expr.args:
@@ -3252,13 +3259,17 @@ class ComposedShiftInliner(NodeTranslator):
         i = 0
         while i + 1 < len(shift_args):
             axis_lit, val_lit = shift_args[i], shift_args[i + 1]
-            if not isinstance(axis_lit, ir.OffsetLiteral) or not isinstance(
+            if not isinstance(axis_lit, (ir.OffsetLiteral, ir.CartesianOffset)) or not isinstance(
                 val_lit, ir.OffsetLiteral
             ):
                 return None
             if not isinstance(val_lit.value, int):
                 return None
-            axis_str = str(axis_lit.value)
+            axis_str = (
+                str(axis_lit.domain.value)
+                if isinstance(axis_lit, ir.CartesianOffset)
+                else str(axis_lit.value)
+            )
             matched = False
             for dim in ("IDim", "JDim", "Kolor"):
                 if dim in axis_str:

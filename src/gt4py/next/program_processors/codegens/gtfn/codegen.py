@@ -191,7 +191,7 @@ class GTFNCodegen(codegen.TemplatedGenerator):
 
     def visit_FunCall(self, node: gtfn_ir.FunCall, **kwargs: Any) -> str:
         if (
-            isinstance(node.fun, gtfn_ir_common.SymRef)
+            isinstance(node.fun, gtfn_ir.SymRef)
             and node.fun.id in {"minimum", "maximum"}
             and len(node.args) == 2
             and any(
@@ -200,7 +200,7 @@ class GTFNCodegen(codegen.TemplatedGenerator):
                 for arg in node.args
             )
         ):
-            normalized_args: list[gtfn_ir_common.Expr] = []
+            normalized_args: list[gtfn_ir.Expr] = []
             for arg in node.args:
                 if isinstance(arg, gtfn_ir.OffsetLiteral) and isinstance(arg.value, int):
                     normalized_args.append(gtfn_ir.IntegralConstant(value=int(arg.value)))

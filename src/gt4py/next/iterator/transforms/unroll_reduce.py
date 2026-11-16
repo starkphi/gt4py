@@ -125,7 +125,7 @@ class UnrollReduce(PreserveLocationVisitor, NodeTranslator):
             neighbor_args = list(_get_neighbors_args(node.args))
             if neighbor_args:
                 offset_tag, it = neighbor_args[0].args
-                is_cartesian_offset = (
+                is_cartesian_offset = isinstance(offset_tag, itir.CartesianOffset) or (
                     isinstance(offset_tag, itir.OffsetLiteral)
                     and isinstance(offset_tag.value, str)
                     and (

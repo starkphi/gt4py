@@ -1290,7 +1290,7 @@ def test_v2e_neighbors_reduce_plus_is_generically_unrolled():
 
     neighbors_applied = im.as_fieldop(im.lambda_("it")(im.neighbors("V2E", "it")))("zavgS")
     mapped = im.as_fieldop(
-        im.lambda_("a", "b")(im.map_("multiplies")(im.deref("a"), im.deref("b")))
+        im.lambda_("a", "b")(im.map_list("multiplies")(im.deref("a"), im.deref("b")))
     )(neighbors_applied, "sign")
     testee = im.as_fieldop(im.lambda_("lst")(im.reduce("plus", 0)(im.deref("lst"))))(mapped)
 
@@ -1314,7 +1314,7 @@ def test_neighbors_reduce_rewritten_for_non_v2e_connection_and_maximum():
         return False
 
     neighbors_applied = im.as_fieldop(im.lambda_("it")(im.neighbors("E2C", "it")))("zavgS")
-    mapped = im.as_fieldop(im.lambda_("a", "b")(im.map_("plus")(im.deref("a"), im.deref("b"))))(
+    mapped = im.as_fieldop(im.lambda_("a", "b")(im.map_list("plus")(im.deref("a"), im.deref("b"))))(
         neighbors_applied, "sign"
     )
     init = im.literal("0.0", "float64")
@@ -1374,7 +1374,7 @@ def test_neighbors_reduce_edge_to_vertex_writes_only_kolor0():
 
     neighbors_applied = im.as_fieldop(im.lambda_("it")(im.neighbors("V2E", "it")))("zavgS")
     mapped = im.as_fieldop(
-        im.lambda_("a", "b")(im.map_("multiplies")(im.deref("a"), im.deref("b")))
+        im.lambda_("a", "b")(im.map_list("multiplies")(im.deref("a"), im.deref("b")))
     )(neighbors_applied, "sign")
     reduce_expr = im.as_fieldop(im.lambda_("lst")(im.reduce("plus", 0)(im.deref("lst"))))(mapped)
 

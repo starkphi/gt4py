@@ -36,7 +36,7 @@ class SimplifyCartesianShifts(NodeTranslator):
                 shift_args.extend(target_arg.fun.args)
                 target_arg = target_arg.args[0]
 
-            accumulated_shifts: dict[str, int] = {}
+            accumulated_shifts: dict = {}  # axis node (OffsetLiteral | CartesianOffset) -> offset
             can_simplify = True
 
             # 3. Accumulate shifts per dimension
@@ -44,13 +44,19 @@ class SimplifyCartesianShifts(NodeTranslator):
                 dim_node = shift_args[i]
                 off_node = shift_args[i + 1]
 
+                # merge-test-main: Cartesian axes are `CartesianOffset(dim, dim)` since upstream #2411
                 if (
-                    isinstance(dim_node, ir.OffsetLiteral)
-                    and isinstance(dim_node.value, str)
+                    (
+                        (isinstance(dim_node, ir.OffsetLiteral) and isinstance(dim_node.value, str))
+                        or (
+                            isinstance(dim_node, ir.CartesianOffset)
+                            and dim_node.domain == dim_node.codomain
+                        )
+                    )
                     and isinstance(off_node, ir.OffsetLiteral)
                     and isinstance(off_node.value, int)
                 ):
-                    dim_name = dim_node.value
+                    dim_name = dim_node
                     accumulated_shifts[dim_name] = (
                         accumulated_shifts.get(dim_name, 0) + off_node.value
                     )
@@ -62,10 +68,13 @@ class SimplifyCartesianShifts(NodeTranslator):
             if can_simplify:
                 new_shift_args = []
                 # Sort to maintain a predictable order in the IR (e.g., IDim, JDim, Kolor)
-                for dim_name in sorted(accumulated_shifts.keys()):
+                for dim_name in sorted(
+                    accumulated_shifts.keys(),
+                    key=lambda n: n.domain.value if isinstance(n, ir.CartesianOffset) else n.value,
+                ):
                     offset = accumulated_shifts[dim_name]
                     if offset != 0:
-                        new_shift_args.append(ir.OffsetLiteral(value=dim_name))
+                        new_shift_args.append(dim_name)
                         new_shift_args.append(ir.OffsetLiteral(value=offset))
 
                 if not new_shift_args:

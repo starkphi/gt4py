@@ -699,6 +699,7 @@ def infer_program(
             symbolic_domain_sizes=symbolic_domain_sizes,
             allow_uninferred=allow_uninferred,
             keep_existing_domains=keep_existing_domains,
+            revisit_already_inferred=revisit_already_inferred,
         )
     finally:
         sys.setrecursionlimit(old_limit)
@@ -711,6 +712,7 @@ def _infer_program_impl(
     symbolic_domain_sizes: Optional[dict[str, itir.Expr]] = None,
     allow_uninferred: bool = False,
     keep_existing_domains: bool = False,
+    revisit_already_inferred: bool = True,
 ) -> itir.Program:
     """
     Infer the domain of all field subexpressions inside a program.
