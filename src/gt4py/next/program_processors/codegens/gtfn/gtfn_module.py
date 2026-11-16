@@ -173,6 +173,17 @@ class GTFNTranslationStep(
         cartesian_reduce_axis_ranges: Optional[dict[common.Dimension, tuple[int, int]]] = None,
         symbolic_domain_sizes: Optional[dict[str, Any]] = None,
     ) -> itir.Program:
+        if os.environ.get("USE_STRUCTURED_BACKEND", "0") != "1":
+            # upstream path: the resolved static-arg dict below must not reach domain inference as
+            # `symbolic_domain_sizes`, it would suppress the dynamic-domain sizes of main.
+            return pass_manager.apply_common_transforms(
+                program,
+                extract_temporaries=True,
+                unroll_reduce=True,
+                offset_provider=offset_provider,
+                symbolic_domain_sizes=self.symbolic_domain_sizes,
+                use_max_domain_range_on_unstructured_shift=self.use_max_domain_range_on_unstructured_shift,
+            )
         effective_symbolic_domain_sizes = (
             self.symbolic_domain_sizes if symbolic_domain_sizes is None else symbolic_domain_sizes
         )

@@ -512,7 +512,7 @@ def _build_periodic_square_index_map(e2v: np.ndarray) -> tuple[IndexMap, Structu
 # Dense edge fields that flip with the edge normal: normal / tangential components, their tendencies and fluxes, d/dn and d/dt slopes.
 _GLOBAL_VECTOR_EDGE_FIELDS = frozenset({
     # normal wind and its time levels / averages
-    "vn", "next_vn", "current_vn", "vn_new", "vn_now", "vn_nnew", "vn_nnow", "vn_traj", "vn_ie", "vn_on_half_levels",
+    "vn", "vn_in", "next_vn", "current_vn", "vn_new", "vn_now", "vn_nnew", "vn_nnow", "vn_traj", "vn_ie", "vn_on_half_levels",
     "vec_e", "p_vn_in", "p_e_in", "z_vn_avg", "spatially_averaged_vn", "substep_and_spatially_averaged_vn",
     "flux_or_velocity", "spatially_averaged_flux_or_velocity", "interpolant", "interpolation_to_half_levels_vp",
     # tangential wind
@@ -538,7 +538,7 @@ _GLOBAL_VECTOR_EDGE_FIELDS = frozenset({
 _GLOBAL_SCALAR_EDGE_FIELDS = frozenset({
     "z_rho_e", "rho_at_edges_on_model_levels", "z_theta_v_e", "theta_v_at_edges_on_model_levels", "z_kin_hor_e",
     "horizontal_kinetic_energy_at_edges_on_model_levels", "z_w_concorr_me", "contravariant_correction_at_edges_on_model_levels",
-    "z_v_grad_w", "horizontal_advection_of_w_at_edges_on_half_levels", "kh_smag_e", "kh_smag_ec",
+    "z_v_grad_w", "horizontal_advection_of_w_at_edges_on_half_levels", "kh_smag", "kh_smag_e", "kh_smag_ec",
     "reference_rho_at_edges_on_model_levels", "reference_theta_at_edges_on_model_levels", "rho_ref_me", "theta_ref_me",
     "edge_kdim_field_with_zero_wp_1", "edge_kdim_field_with_zero_wp_2", "out_field",
     "wgtfac_e", "wgtfacq_e", "ddqz_z_full_e", "pg_exdist", "pg_exdist_dsl", "e_lev", "flat_idx_max", "nudgecoeff_e", "nudging_coefficients_for_edges", "refin_ctrl", "e_refin_ctrl",
