@@ -109,6 +109,75 @@ def _use_xp_pack(field) -> bool:
         and os.environ.get("DACE_K_INNER_LAYOUT", "0") != "1"
     )
 _ARG_TIMES: dict = {}  # (program, arg, "pack"|"unpack", kind) -> [calls, seconds]
+_COMPILE_TIMES: dict = {}  # program -> [compiles, seconds] (setup_program: passes + codegen + build or build-cache lookup)
+_FIRST_CALL: dict = {}  # program -> seconds of the first call of each wrapper instance (compile + first pack/exec/unpack)
+
+# GT4PY_STRUCTURED_TRANSLATION_CACHE (default 1; 0 = off, e.g. when debugging the passes): persistent cache of the gtfn translation (structured passes + codegen) across
+# processes. The interceptor normally switches the translation cache off because its upstream key (ITIR fingerprint) lacks
+# symbolic_domain_sizes / horizontal_start; this one adds sds, the GT4PY_*/USE_STRUCTURED* env (mesh, pack tables, pass
+# switches) and a hash of the gt4py sources (so a cache copied with CACHE_FROM never outlives a code change).
+_TRANSLATION_CACHE_ON = os.environ.get("GT4PY_STRUCTURED_TRANSLATION_CACHE", "1") != "0"
+_TC_ENV_EXCLUDE = {"GT4PY_BUILD_CACHE_DIR", "GT4PY_BUILD_CACHE_LIFETIME", "GT4PY_PRINT_IR_FILE", "GT4PY_STRUCTURED_TIMING",
+                   "GT4PY_GLOBAL_MIRROR_CHECK", "GT4PY_STRUCTURED_TRANSLATION_CACHE", "GT4PY_BUILD_JOBS"}
+_TC_STATS = {"hit": 0, "miss": 0}
+
+
+def _tc_canon(v):
+    """Canonical, pickle-stable form of symbolic_domain_sizes values for the cache key."""
+    if isinstance(v, dict):
+        return tuple(sorted(((repr(k), _tc_canon(x)) for k, x in v.items()), key=lambda kv: kv[0]))
+    if isinstance(v, (list, tuple)):
+        return tuple(_tc_canon(x) for x in v)
+    if isinstance(v, (set, frozenset)):
+        return tuple(sorted(repr(_tc_canon(x)) for x in v))
+    if isinstance(v, np.ndarray):
+        import hashlib
+
+        return ("ndarray", str(v.dtype), v.shape, hashlib.sha256(np.ascontiguousarray(v).tobytes()).hexdigest())
+    if isinstance(v, np.generic):
+        return v.item()
+    if v is None or isinstance(v, (bool, int, float, str)):
+        return v
+    return repr(v)  # an address in a repr only costs cache misses, never a wrong hit
+
+
+@functools.cache
+def _tc_source_hash() -> str:
+    import hashlib
+    import pathlib
+
+    root = pathlib.Path(gtx.__file__).parent
+    h = hashlib.sha256()
+    for f in sorted(root.rglob("*.py")):
+        h.update(str(f.relative_to(root)).encode())
+        h.update(f.read_bytes())
+    return h.hexdigest()
+
+
+def _with_structured_translation_cache(backend, sds: dict, program_name: str):
+    """Return `backend` with a persistent, sds-aware translation cache in front of its gtfn translation step."""
+    import dataclasses
+
+    from gt4py._core import filecache
+    from gt4py.eve import utils as eve_utils
+    from gt4py.next import config as _cfg
+    from gt4py.next.otf import stages as _stages, workflow as _wf
+
+    env = tuple(sorted((k, v) for k, v in os.environ.items()
+                       if (k.startswith("GT4PY_") or k.startswith("USE_STRUCTURED")) and k not in _TC_ENV_EXCLUDE))
+    extra = eve_utils.content_hash((_tc_canon(sds), env, _tc_source_hash()))
+    cache = filecache.FileCache(str(_cfg.BUILD_CACHE_DIR / "structured_translation_cache"))
+
+    def key(program_def) -> str:
+        k = _stages.fingerprint_compilable_program(program_def) + "_" + extra
+        _TC_STATS["hit" if k in cache else "miss"] += 1
+        return k
+
+    executor = backend.executor
+    assert isinstance(executor, _wf.CachedStep), type(executor)
+    otf = executor.step
+    otf = otf.replace(translation=_wf.CachedStep(otf.translation, hash_function=key, cache=cache))
+    return dataclasses.replace(backend, executor=_wf.CachedStep(otf, hash_function=executor.hash_function))
 
 
 def _report_timing() -> None:
@@ -130,6 +199,13 @@ def _report_timing() -> None:
               f" {_other(t):8.3f} {t['call']:9.3f} {t['nfields'] / n:8.1f} {t['mbytes'] / n:8.1f}")
     print(f"{'TOTAL':55s} {tot['calls']:6d} {tot['pack']:9.3f} {tot['lookup']:9.3f} {tot['exec']:9.3f} {tot['unpack']:9.3f}"
           f" {_other(tot):8.3f} {tot['call']:9.3f} {tot['nfields']:8d} {tot['mbytes']:8.0f}")
+    if _COMPILE_TIMES:
+        n = sum(c for c, _ in _COMPILE_TIMES.values())
+        print(f"compile (setup_program): {n} compiles, {sum(t for _, t in _COMPILE_TIMES.values()):.1f} s;"
+              f" first calls total {sum(_FIRST_CALL.values()):.1f} s; translation cache {_TC_STATS}"
+              f" ({'on' if _TRANSLATION_CACHE_ON else 'off'})")
+        for name, (c, t) in sorted(_COMPILE_TIMES.items(), key=lambda kv: -kv[1][1])[:15]:
+            print(f"  compile {t:8.2f} s {c:3d}x  first call {_FIRST_CALL.get(name, 0.0):8.2f} s  {name}")
     if any(_MIRROR_STATS.values()):
         print(f"mirror cache: {_MIRROR_STATS}, entries at exit {len(_MIRRORS)}")
     if _POOL_PEAK[1]:
@@ -1417,6 +1493,8 @@ class GenericStructuredWrapper:
                 otf_workflow__bare_translation__symbolic_domain_sizes=sds,
                 gpu=self._use_gpu,
             )
+            if _TRANSLATION_CACHE_ON:
+                structured_backend = _with_structured_translation_cache(structured_backend, sds, self.operator_name)
         # Store sds so __call__ can re-set the ContextVar at DaCe pool-thread compile time.
         self._sds_cache[cache_key] = sds
         from gt4py.next.program_processors.program_setup_utils import setup_program as _setup
@@ -1434,6 +1512,10 @@ class GenericStructuredWrapper:
         # print(f"Current_compile_sds: {_CURRENT_COMPILE_SDS}")
         _compile_end = time.perf_counter()
         _compile_elapsed = _compile_end - _compile_start
+        if _TIMING:
+            rec = _COMPILE_TIMES.setdefault(self.operator_name, [0, 0.0])
+            rec[0] += 1
+            rec[1] += _compile_elapsed
         # print(f"[timing] {self.operator_name} compilation: {_compile_elapsed:.8f}s")
         self._compiled_cache[cache_key] = compiled
         return compiled
@@ -2349,6 +2431,8 @@ class GenericStructuredWrapper:
                 t["lookup"] += _lookup_elapsed
                 t["exec"] += _exec_elapsed
                 t["unpack"] += _unpack_elapsed
+            else:
+                _FIRST_CALL[self.operator_name] = _FIRST_CALL.get(self.operator_name, 0.0) + time.perf_counter() - _call_start
             self._timing_calls += 1
 
         # Print timing summary
