@@ -249,11 +249,13 @@ class SymbolicDomain:
 
                 assert new_dim not in new_ranges or old_dim == new_dim
 
-                if (
-                    symbolic_domain_sizes is None or new_dim.value not in symbolic_domain_sizes
-                ) and not common.is_neighbor_table(connectivity):
-                    # structured backend (merge: kept from structured_global): type-only provider
-                    # without a size for the codomain -> leave the domain unchanged
+                if old_dim not in new_ranges or (
+                    (symbolic_domain_sizes is None or new_dim.value not in symbolic_domain_sizes)
+                    and not common.is_neighbor_table(connectivity)
+                ):
+                    # structured backend (merge: kept from structured_global): the domain is already
+                    # structured (no `old_dim`), or a type-only provider without a size for the
+                    # codomain -> leave the domain unchanged (what the old fallback amounted to)
                     return self
 
                 if symbolic_domain_sizes is not None and new_dim.value in symbolic_domain_sizes:

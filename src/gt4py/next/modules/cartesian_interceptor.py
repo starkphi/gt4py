@@ -678,6 +678,39 @@ def _trailing_starts(field) -> dict:
     return {d: int(r.start) for d, r in zip(dom.dims[1:], dom.ranges[1:])}
 
 
+def _split_field_operator_domain(domain, out) -> dict | None:
+    """Vertical part of the `domain` of a field operator call (None if it is the whole output).
+
+    The structured path writes the whole structured output frame, so the horizontal ranges of
+    `domain` must cover the whole (unstructured) output field; anything else is not supported yet.
+    """
+    if out is None:
+        raise NotImplementedError("structured wrapper: field operator call with `domain` but no `out`")
+    out_domain = (out[0] if isinstance(out, tuple) else out).domain
+    vertical = {}
+    for dim, (start, stop) in _domain_items(domain):
+        if dim.kind == gtx.common.DimensionKind.VERTICAL:
+            out_rng = out_domain[dim].unit_range
+            if (start, stop) != (out_rng.start, out_rng.stop):
+                vertical[dim] = (start, stop)
+            continue
+        out_rng = out_domain[dim].unit_range
+        if (start, stop) != (out_rng.start, out_rng.stop):
+            raise NotImplementedError(
+                f"structured wrapper: field operator `domain` covers only part of {dim.value} "
+                f"([{start}, {stop}) of [{out_rng.start}, {out_rng.stop})); use a program with "
+                "horizontal_start/end instead"
+            )
+    return vertical or None
+
+
+def _domain_items(domain):
+    """(dim, (start, stop)) pairs of a `domain=` argument (dict or gt4py Domain)."""
+    if isinstance(domain, dict):
+        return [(dim, (int(r[0]), int(r[1]))) for dim, r in domain.items()]
+    return [(nr.dim, (nr.unit_range.start, nr.unit_range.stop)) for nr in domain]
+
+
 def _check_zone_thresholds(kwargs: dict, n_entity: dict[str, int]) -> None:
     """The structured passes translate the thresholds in ZONE_THRESHOLDS from their zone where the zone is a fixed
     region ("none" / "owned" / "all", see zone_region_below), not from the integer. Check that the integer passed
@@ -1751,6 +1784,13 @@ class GenericStructuredWrapper:
             except AttributeError:
                 pass
 
+        # Field operator called as a program with `domain=` (gt4py/icon4py main): the horizontal part
+        # must cover the whole output (the structured output frame is written in full); the
+        # vertical part is kept and applied to the structured output by FieldOperator.__call__.
+        _fo_vertical_domain = None
+        if "domain" in kwargs and not hasattr(self._operator, "past_stage"):
+            _fo_vertical_domain = _split_field_operator_domain(kwargs.pop("domain"), kwargs.get("out"))
+
         # Determine horizontal_start and thresholds BEFORE packing so shift is known.
         hs_raw = (
             kwargs.get("horizontal_start_edge")
@@ -1869,18 +1909,26 @@ class GenericStructuredWrapper:
 
                 merged_kwargs = {**bound_kwargs, **structured_kwargs}
 
-                params = getattr(compiled.func.past_stage.past_node, "params", ())
-                ordered_args = []
-                for param in params:
-                    name = str(param.id)
-                    if name in merged_kwargs:
-                        ordered_args.append(merged_kwargs.pop(name))
+                if not hasattr(compiled.func, "past_stage"):
+                    # field operator (no PAST, gt4py main): its __call__ handles `out` / `domain`
+                    if _fo_vertical_domain:
+                        merged_kwargs["domain"] = _fo_vertical_domain
+                    compiled.func(
+                        **merged_kwargs, offset_provider=offset_provider, enable_jit=enable_jit
+                    )
+                else:
+                    params = getattr(compiled.func.past_stage.past_node, "params", ())
+                    ordered_args = []
+                    for param in params:
+                        name = str(param.id)
+                        if name in merged_kwargs:
+                            ordered_args.append(merged_kwargs.pop(name))
 
-                compiled.func._compiled_programs(
-                    *ordered_args,
-                    offset_provider=offset_provider,
-                    enable_jit=enable_jit,
-                )
+                    compiled.func._compiled_programs(
+                        *ordered_args,
+                        offset_provider=offset_provider,
+                        enable_jit=enable_jit,
+                    )
             else:
                 # Fallback for non-partial wrappers.
                 compiled(**structured_kwargs)
