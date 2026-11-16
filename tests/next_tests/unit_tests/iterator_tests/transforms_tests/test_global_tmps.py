@@ -636,7 +636,7 @@ def test_if_branch_reused_at_shifted_position(uids: utils.IDGeneratorPool):
     # `w` is needed on K [0, 36), the `if_` (and its temporary) only on K [0, 35). Both branches
     # must write K [0, 35) only.
     domain = im.domain("cartesian_domain", {IDim: (0, 4), KDim: (0, 35)})
-    Koff = "Koff"
+    Koff = im.cartesian_offset(KDim, KDim)
     testee = _if_branch_program(
         im.let("w", im.as_fieldop(im.lambda_("x")(im.multiplies_(im.deref("x"), 2.0)))("inp"))(
             im.make_tuple(
@@ -647,10 +647,10 @@ def test_if_branch_reused_at_shifted_position(uids: utils.IDGeneratorPool):
         ["out0", "out1"],
         domain,
     )
-    testee = type_inference.infer(testee, offset_provider_type={"Koff": KDim})
-    testee = infer_domain.infer_program(testee, offset_provider={"Koff": KDim})
+    testee = type_inference.infer(testee, offset_provider_type={})
+    testee = infer_domain.infer_program(testee, offset_provider={})
 
-    actual = global_tmps.create_global_tmps(testee, {"Koff": KDim}, uids=uids)
+    actual = global_tmps.create_global_tmps(testee, {}, uids=uids)
 
     _assert_writes_within_targets(actual, {"out0": domain, "out1": domain})
 
@@ -659,7 +659,7 @@ def test_tuple_if_branch_reused_at_shifted_position(uids: utils.IDGeneratorPool)
     # Same as `test_if_branch_reused_at_shifted_position`, but with a tuple-valued `if_` whose
     # branches are a tuple temporary that is also read shifted.
     domain = im.domain("cartesian_domain", {IDim: (0, 4), KDim: (0, 35)})
-    Koff = "Koff"
+    Koff = im.cartesian_offset(KDim, KDim)
     testee = _if_branch_program(
         im.let(
             "t", im.as_fieldop(im.lambda_("x")(im.make_tuple(im.deref("x"), im.deref("x"))))("inp")
@@ -677,9 +677,9 @@ def test_tuple_if_branch_reused_at_shifted_position(uids: utils.IDGeneratorPool)
         ["out0", "out1", "out2"],
         domain,
     )
-    testee = type_inference.infer(testee, offset_provider_type={"Koff": KDim})
-    testee = infer_domain.infer_program(testee, offset_provider={"Koff": KDim})
+    testee = type_inference.infer(testee, offset_provider_type={})
+    testee = infer_domain.infer_program(testee, offset_provider={})
 
-    actual = global_tmps.create_global_tmps(testee, {"Koff": KDim}, uids=uids)
+    actual = global_tmps.create_global_tmps(testee, {}, uids=uids)
 
     _assert_writes_within_targets(actual, {"out0": domain, "out1": domain, "out2": domain})

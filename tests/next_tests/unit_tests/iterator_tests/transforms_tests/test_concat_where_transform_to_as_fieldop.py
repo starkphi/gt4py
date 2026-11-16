@@ -26,12 +26,12 @@ def test_in_helper():
     }
     expected = im.and_(
         im.and_(
-            im.less_equal(im.literal("3", "int64"), im.tuple_get(0, pos)),
-            im.less(im.tuple_get(0, pos), im.literal("4", "int64")),
+            im.less_equal(bounds[IDim][0], im.tuple_get(0, pos)),
+            im.less(im.tuple_get(0, pos), bounds[IDim][1]),
         ),
         im.and_(
-            im.less_equal(im.literal("5", "int64"), im.tuple_get(1, pos)),
-            im.less(im.tuple_get(1, pos), im.literal("6", "int64")),
+            im.less_equal(bounds[JDim][0], im.tuple_get(1, pos)),
+            im.less(im.tuple_get(1, pos), bounds[JDim][1]),
         ),
     )
     actual = _in(pos, im.domain(common.GridType.CARTESIAN, bounds))
