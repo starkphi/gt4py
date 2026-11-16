@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import os
 import warnings
 from typing import Callable, Iterable, Literal, Optional
 
@@ -248,25 +249,12 @@ class SymbolicDomain:
 
                 assert new_dim not in new_ranges or old_dim == new_dim
 
-                # If the new_dim is not in symbolic_domain_sizes, try to compute it from the connectivity
-                if symbolic_domain_sizes is None or new_dim.value not in symbolic_domain_sizes:
-                    # Try to extract the size from the offset provider itself
-                    offset_name = off.value if isinstance(off, itir.OffsetLiteral) else None
-                    if offset_name and common.is_offset_provider(offset_provider):
-                        provider = offset_provider.get(offset_name)
-                        if provider is not None and common.is_neighbor_connectivity(provider):
-                            # Extract codomain size from the connectivity array
-                            max_neighbor = int(provider.ndarray.max())  # type: ignore[attr-defined]
-                            # ensure the dict exists before assigning
-                            if symbolic_domain_sizes is None:
-                                symbolic_domain_sizes = {}
-                            symbolic_domain_sizes[new_dim.value] = im.literal(
-                                str(max_neighbor + 1), builtins.INTEGER_INDEX_BUILTIN
-                            )
-
-                    # If still not found, skip this translation - return unchanged domain
-                    if symbolic_domain_sizes is None or new_dim.value not in symbolic_domain_sizes:
-                        return self
+                if (
+                    symbolic_domain_sizes is None or new_dim.value not in symbolic_domain_sizes
+                ) and not common.is_neighbor_table(connectivity):
+                    # structured backend (merge: kept from structured_global): type-only provider
+                    # without a size for the codomain -> leave the domain unchanged
+                    return self
 
                 if symbolic_domain_sizes is not None and new_dim.value in symbolic_domain_sizes:
                     new_range = SymbolicRange(
@@ -348,73 +336,28 @@ def _reduce_domains(
 ) -> SymbolicDomain:
     """
     Applies range_op to the ranges of a list of domains with same dimensions and grid_type.
+
+    With USE_STRUCTURED_BACKEND=1 the domains may differ in their dimensions (e.g. Kolor only on
+    some); they are promoted to the union of all dimensions first.
     """
     assert all(domain.grid_type == domains[0].grid_type for domain in domains)
 
     dims: list[common.Dimension] = [*domains[0].ranges.keys()]
-    for domain in domains[1:]:
-        for dim in domain.ranges.keys():
-            if dim not in dims:
-                dims.append(dim)
+    if os.environ.get("USE_STRUCTURED_BACKEND", "0") == "1":
+        for domain in domains[1:]:
+            for dim in domain.ranges.keys():
+                if dim not in dims:
+                    dims.append(dim)
+        domains = tuple(promote_domain(domain, dims) for domain in domains)
+    assert all(domain.ranges.keys() == domains[0].ranges.keys() for domain in domains)
 
-    promoted_domains = [promote_domain(domain, dims) for domain in domains]
-    new_domain_ranges = {
-        dim: range_reduce_op(*(domain.ranges[dim] for domain in promoted_domains)) for dim in dims
-    }
-
-    return SymbolicDomain(domains[0].grid_type, new_domain_ranges)
-
-
-def _range_is_empty(range_: SymbolicRange) -> bool:
-    """Return True if the range [start, stop) is empty or inverted after constant folding.
-
-    Handles:
-    - Empty ranges [k, k) where start == stop → zero width.
-    - Inverted ranges [k', k) where start > stop → arise from intersections of disjoint
-      domains (e.g. Kolor:[2,3) ∩ Kolor:[-inf,1) = Kolor:[2,1)) and are semantically empty.
-
-    Handles both OffsetLiteral (int .value) and Literal (str .value) node types.
-    InfinityLiteral.NEGATIVE/POSITIVE lack a numeric .value and are treated as non-empty.
-    """
-    start = ConstantFolding.apply(range_.start)
-    stop = ConstantFolding.apply(range_.stop)
-    try:
-        return int(start.value) >= int(stop.value)  # empty (==) or inverted (>)
-    except (AttributeError, ValueError, TypeError):
-        return False  # InfinityLiteral or non-constant → assume non-empty
-
-
-def domain_union(*domains: SymbolicDomain) -> SymbolicDomain:
-    """Return the (set) union of a list of domains.
-
-    Empty ranges [a, a) that arise from intersections with disjoint conditions (e.g.
-    Kolor:[-inf,0) ∩ Kolor:[0,3) = Kolor:[0,0)) are excluded from the union. Without
-    this, _domain_union([0,0), [1,3)) = [0,3) (wrong) instead of [1,3) (correct).
-    The structured backend generates canonical concat_where conditions via
-    canonicalize_domain_argument that produce such empty intersections for kolor branches
-    that are out of range; including them widens E2C cell-field kolor domains to negative
-    indices → CUDA_ERROR_ILLEGAL_ADDRESS on big grids.
-    """
-    assert all(domain.grid_type == domains[0].grid_type for domain in domains)
-
-    dims: list[common.Dimension] = [*domains[0].ranges.keys()]
-    for domain in domains[1:]:
-        for dim in domain.ranges.keys():
-            if dim not in dims:
-                dims.append(dim)
-
-    promoted_domains = [promote_domain(domain, dims) for domain in domains]
-    new_domain_ranges: dict[common.Dimension, SymbolicRange] = {}
-    for dim in dims:
-        all_ranges = [domain.ranges[dim] for domain in promoted_domains]
-        non_empty = [r for r in all_ranges if not _range_is_empty(r)]
-        if non_empty:
-            new_domain_ranges[dim] = _range_union(*non_empty)
-        else:
-            # All ranges are empty; keep first (caller should handle NEVER propagation)
-            new_domain_ranges[dim] = all_ranges[0]
+    new_domain_ranges = {dim: range_reduce_op(*(d.ranges[dim] for d in domains)) for dim in dims}
 
     return SymbolicDomain(domains[0].grid_type, new_domain_ranges)
+
+
+domain_union = functools.partial(_reduce_domains, range_reduce_op=_range_union)
+"""Return the (set) union of a list of domains."""
 
 domain_intersection = functools.partial(_reduce_domains, range_reduce_op=_range_intersection)
 """Return the intersection of a list of domains."""

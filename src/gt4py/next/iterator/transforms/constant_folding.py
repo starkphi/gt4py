@@ -54,12 +54,11 @@ def _numeric_constant_value(node: ir.Node) -> int | float | None:
     if isinstance(node, ir.Literal):
         try:
             value = ir_misc.value_from_literal(node)
+            # keep the numpy scalar type (e.g. int32) so folded literals keep the dtype
             if isinstance(value, (int, float)):
                 return value
-            if hasattr(value, "item"):
-                coerced = value.item()
-                if isinstance(coerced, (int, float)):
-                    return coerced
+            if hasattr(value, "item") and isinstance(value.item(), (int, float)):
+                return value  # type: ignore[return-value]
             return None
         except ValueError:
             return None
