@@ -77,10 +77,12 @@ def _is_tuple_of_ref_or_literal(expr: itir.Expr) -> bool:
 
 
 def _get_domains(nodes: Iterable[itir.Stmt]) -> Iterable[itir.FunCall]:
-    result = set()
+    # dict, not set: keep IR walk order so the generated code (whose hash is the build-cache key) is the same
+    # in every process (set order of IR nodes depends on PYTHONHASHSEED).
+    result: dict[itir.FunCall, None] = {}
     for node in nodes:
-        result |= node.walk_values().if_isinstance(itir.SetAt).getattr("domain").to_set()
-    return result
+        result.update(dict.fromkeys(node.walk_values().if_isinstance(itir.SetAt).getattr("domain")))
+    return result.keys()
 
 
 def _name_from_named_range(named_range_call: itir.FunCall) -> str:
@@ -200,7 +202,7 @@ def _collect_offset_definitions(
     # to avoid introducing irrelevant connectivity tags into code generation.
     offset_provider_type = {
         offset_name: common.get_offset_type(offset_provider_type, offset_name)
-        for offset_name in used_offset_tags
+        for offset_name in sorted(used_offset_tags)  # sorted: set order changes per process (cache key)
     }
     offset_definitions = {}
 
@@ -525,7 +527,7 @@ class GTFN_lowering(eve.NodeTranslator, eve.VisitorWithSymbolTableTrait):
         connectivities = []
         if "stencil" in kwargs:
             shift_offsets = self._collect_offset_or_axis_node(itir.OffsetLiteral, kwargs["stencil"])
-            for o in shift_offsets:
+            for o in sorted(shift_offsets):  # sorted: deterministic generated code (build-cache key)
                 if o in self.offset_provider_type and isinstance(
                     common.get_offset_type(self.offset_provider_type, o),
                     common.NeighborConnectivityType,
