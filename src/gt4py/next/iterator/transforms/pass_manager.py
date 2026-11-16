@@ -21,6 +21,7 @@ from gt4py.next.iterator.transforms import (
     cart_unroll,
     concat_where,
     dead_code_elimination,
+    expand_neighbor_lists,
     fuse_as_fieldop,
     global_tmps,
     infer_domain,
@@ -414,6 +415,9 @@ def apply_common_transforms(
 
     # ir = cart_unroll.CartUnroll.apply(ir, symbolic_domain_sizes=symbolic_domain_sizes)
     if os.environ.get("USE_STRUCTURED_BACKEND", "0") == "1":
+        # neighbor-list fields (e.g. `laplacian_on_edge`) -> per-slot shifts
+        ir = expand_neighbor_lists.ExpandNeighborLists.apply(ir)
+        _print_ir_block("=== GTIR AFTER EXPANDING NEIGHBOR LISTS ===", ir, enabled=print_ir)
         ir = cart_unroll.CartesianDomainAndTypeRemapper.apply(  # type: ignore[assignment]
             ir,
             symbolic_domain_sizes=cast(dict[str, str | int] | None, symbolic_domain_sizes),
