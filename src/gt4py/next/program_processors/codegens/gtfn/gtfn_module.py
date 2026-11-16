@@ -177,10 +177,17 @@ class GTFNTranslationStep(
         cartesian_reduce_axis_ranges: Optional[dict[common.Dimension, tuple[int, int]]] = None,
         symbolic_domain_sizes: Optional[dict[str, Any]] = None,
     ) -> itir.Program:
-        effective_symbolic_domain_sizes = (
-            self.symbolic_domain_sizes if symbolic_domain_sizes is None else symbolic_domain_sizes
-        )
-        program = pass_manager.pre_inline_scalar_params(program, effective_symbolic_domain_sizes)
+        if os.environ.get("USE_STRUCTURED_BACKEND", "0") != "1":
+            # upstream path: the resolved static-arg dict must not reach domain inference as
+            # `symbolic_domain_sizes`, a non-empty dict suppresses the dynamic-domain sizes
+            # (`_process_symbolic_domains_option`) and static translate then hits symbolic ranges.
+            effective_symbolic_domain_sizes = self.symbolic_domain_sizes
+            cartesian_reduce_axis_ranges = None
+        else:
+            effective_symbolic_domain_sizes = (
+                self.symbolic_domain_sizes if symbolic_domain_sizes is None else symbolic_domain_sizes
+            )
+            program = pass_manager.pre_inline_scalar_params(program, effective_symbolic_domain_sizes)
         apply_common_transforms = functools.partial(
             pass_manager.apply_common_transforms,
             extract_temporaries=True,
