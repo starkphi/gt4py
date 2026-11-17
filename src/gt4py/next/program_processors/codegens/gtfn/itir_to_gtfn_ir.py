@@ -85,6 +85,22 @@ def _get_domains(nodes: Iterable[itir.Stmt]) -> Iterable[itir.FunCall]:
     return result.keys()
 
 
+def _kolor_last(tv: TaggedValues) -> TaggedValues:
+    """Structured (I, J, Kolor, K) domains: move Kolor to the end. The gtfn GPU backend maps only the first three
+    domain dims to the CUDA grid and loops the rest inside each thread, so with Kolor third every thread ran all K
+    levels (~22k threads per kernel at R02B04). Kolor (2-3 values) is the cheap one to loop. Block sizes are keyed by
+    dim, temporaries stay unit-stride in I. GT4PY_STRUCTURED_KOLOR_LAST=0 keeps the IR order."""
+    import os
+
+    if os.environ.get("GT4PY_STRUCTURED_KOLOR_LAST", "1") == "0" or len(tv.tags) < 4:
+        return tv
+    names = [str(t.value) if isinstance(t, Literal) else str(t) for t in tv.tags]
+    if "Kolor" not in names or names[-1] == "Kolor":
+        return tv
+    order = [i for i, n in enumerate(names) if n != "Kolor"] + [names.index("Kolor")]
+    return TaggedValues(tags=[tv.tags[i] for i in order], values=[tv.values[i] for i in order])
+
+
 def _name_from_named_range(named_range_call: itir.FunCall) -> str:
     assert isinstance(named_range_call, itir.FunCall) and named_range_call.fun == itir.SymRef(
         id="named_range"
@@ -520,6 +536,7 @@ class GTFN_lowering(eve.NodeTranslator, eve.VisitorWithSymbolTableTrait):
 
     def _visit_cartesian_domain(self, node: itir.FunCall, **kwargs: Any) -> Node:
         sizes, domain_offsets = self._make_domain(node)
+        sizes, domain_offsets = _kolor_last(sizes), _kolor_last(domain_offsets)
         return CartesianDomain(tagged_sizes=sizes, tagged_offsets=domain_offsets)
 
     def _visit_unstructured_domain(self, node: itir.FunCall, **kwargs: Any) -> Node:
