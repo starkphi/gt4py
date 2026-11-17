@@ -404,6 +404,11 @@ class GTFNCodegen(codegen.TemplatedGenerator):
                 filtered_offset_definitions = offset_definitions
 
             block_sizes = [32, 8] + [1] * (len(filtered_offset_definitions) - 2)
+            names = [str(tag.name.id) for tag in filtered_offset_definitions]
+            if "Kolor" in names:
+                # structured (I, J, K, Kolor): by name, not by position. The positional rule follows the order in which
+                # the program's domains mention the dims, e.g. gave K 32, IDim 8, JDim 1 when a K-only domain came first.
+                block_sizes = [{"IDim": 32, "JDim": 8}.get(n, 1) for n in names]
             for i, tag in enumerate(filtered_offset_definitions):
                 if tag.alias is None:
                     block_dims.append(
