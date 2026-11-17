@@ -229,6 +229,23 @@ _KNOWN_CELL_THRESHOLD_PARAMS: frozenset[str] = frozenset({
 _KNOWN_BOOL_SCALAR_PARAMS: frozenset[str] = frozenset({
     "limited_area",
 })
+# GT4PY_STRUCTURED_STATIC_VARIANTS (default 1): also bake the static params that icon4py's setup_program declares
+# (keys of `variants` + scalar `constant_args`, passed as `static_params`) per call value, as the unstructured path does
+# via Program.compile. They reach pre_inline_scalar_params as `__static_scalar__<name>` sds keys (typed literals:
+# bool / int / float), so e.g. `if is_iau_active` / `rayleigh_type == 2` fold away. Without it a runtime `if` keeps dead
+# tuple branches (global_tmps then skips the SetAt, merge_test "Failure 6") and shared values become global temporaries.
+_STATIC_VARIANTS_ON = os.environ.get("GT4PY_STRUCTURED_STATIC_VARIANTS", "1") != "0"
+
+
+def _static_scalar_value(val):
+    """Typed Python value of a static scalar call argument (bool / int / float), or None."""
+    if isinstance(val, (bool, np.bool_)):
+        return bool(val)
+    if isinstance(val, (int, np.integer)):  # incl. IntEnum (e.g. RayleighType)
+        return int(val)
+    if isinstance(val, (float, np.floating)):
+        return float(val)
+    return None
 
 
 def _inject_edge_range_bounds(
@@ -549,6 +566,9 @@ _GLOBAL_SCALAR_EDGE_FIELDS = frozenset({
     "edge_neighbor_0_lat", "edge_neighbor_0_lon", "edge_neighbor_1_lat", "edge_neighbor_1_lon",
     "u", "v", "x", "y", "z", "u_cell_1", "u_cell_2", "v_cell_1", "v_cell_2",
     "u_vertex_1", "u_vertex_2", "u_vertex_3", "u_vertex_4", "v_vertex_1", "v_vertex_2", "v_vertex_3", "v_vertex_4",
+    # generic POINTWISE math programs (generic_math_operations.py: copy_field_on_edge_k, a + c*b; main's diffusion copies vn
+    # with them): no neighbour reads, so the mirror sign never reaches an owned value -> unsigned is right for vector fields too
+    "field", "output_field", "field_a", "field_b",
 })
 assert not _GLOBAL_VECTOR_EDGE_FIELDS & _GLOBAL_SCALAR_EDGE_FIELDS
 # Sparse coefficients: (sign of the centre edge, sign of the target edge). Centre: the coefficient carries the centre edge's
@@ -829,8 +849,10 @@ class GenericStructuredWrapper:
         allocator,
         offset_provider,
         symbolic_domain_sizes: dict | None = None,
+        static_params: frozenset[str] = frozenset(),
     ):
         self.index_map = index_map
+        self._static_params = frozenset(static_params) if _STATIC_VARIANTS_ON else frozenset()
         self.allocator = allocator
         self.operator_name = getattr(operator, "id", None) or getattr(operator, "__name__", "")
         self._timing_calls = 0
@@ -1056,7 +1078,7 @@ class GenericStructuredWrapper:
         self,
         horizontal_start: int,
         extra_thresholds: tuple[tuple[str, int], ...] = (),
-        extra_scalars: tuple[tuple[str, bool], ...] = (),
+        extra_scalars: tuple[tuple[str, bool | int | float], ...] = (),
     ):
         """Return (and cache) a compiled program for the given horizontal_start + thresholds."""
         cache_key = (horizontal_start, extra_thresholds, extra_scalars)
@@ -1134,7 +1156,10 @@ class GenericStructuredWrapper:
         # ir.Literal before DCE folds the dead if/else branch (e.g. limited_area=False
         # removes the limited_area=True concat_where branch from the GT4Py IR entirely).
         for name, val in extra_scalars:
-            sds[name] = val
+            if name in self._static_params:
+                sds[f"__static_scalar__{name}"] = val
+            else:
+                sds[name] = val
 
         # Origin-shift: move the coordinate origin so the first interior write lands at
         # buffer offset 0 (cache-aligned). Detect the OUTPUT entity first so we compute
@@ -1827,7 +1852,12 @@ class GenericStructuredWrapper:
             (name, bool(val))
             for name, val in kwargs.items()
             if name in _KNOWN_BOOL_SCALAR_PARAMS
+            and name not in self._static_params
             and isinstance(val, (bool, np.bool_))
+        )) + tuple(sorted(
+            (name, sval)
+            for name, val in kwargs.items()
+            if name in self._static_params and (sval := _static_scalar_value(val)) is not None
         ))
 
         # Compute origin shift before packing. Must match what _get_or_compile stores
