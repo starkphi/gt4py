@@ -29,6 +29,8 @@ from gt4py.next.iterator.type_system import type_specifications as it_ts
 from gt4py.next.type_system import type_specifications as ts
 
 from gt4py.next.iterator.transforms.structured_backend_passes import (
+    _domain_with_vertical_dims_of,
+    _split_mixed_entity_tuple_setat,
     _minus_one,
     _offset_add,
     _offset_sub,
@@ -559,3 +561,77 @@ class TestFullPipelineIntegration:
         assert len(result.body) == 1, "Vertex SetAt should NOT be split (1 kolor)"
         dom = result.body[0].domain
         assert cpm.is_call_to(dom, "cartesian_domain"), "Vertex domain should be structured"
+
+
+# ── Mixed-entity tuple SetAt (upstream combined programs) ─────────────────────
+
+_K = common.Dimension("K", common.DimensionKind.VERTICAL)
+_KH = common.Dimension("_StaggeredK", common.DimensionKind.VERTICAL)
+
+
+def _udom(entity: str, vdim: common.Dimension) -> ir.Expr:
+    return im.domain(
+        common.GridType.UNSTRUCTURED,
+        {common.Dimension(entity): (0, 10), vdim: (0, 5)},
+    )
+
+
+def test_split_mixed_entity_tuple_setat_groups_by_entity_and_vertical_dim():
+    # let(a = x) in {a, y, z}  @ {Edge x K, Cell x _StaggeredK, Cell x _StaggeredK}
+    expr = im.let("a", "x")(im.make_tuple("a", "y", "z"))
+    stmt = ir.SetAt(
+        expr=expr,
+        domain=im.make_tuple(
+            _udom("Edge", _K), _udom("Cell", _KH), _udom("Cell", _KH)
+        ),
+        target=im.make_tuple("o0", "o1", "o2"),
+    )
+    parts = _split_mixed_entity_tuple_setat(stmt)
+    assert parts is not None and len(parts) == 2
+    # Edge group keeps the let, single output -> no tuple
+    assert parts[0].target == im.ref("o0")
+    assert parts[0].expr == im.let("a", "x")("a")
+    # Cell group: the let is dead there and dropped
+    assert parts[1].target == im.make_tuple("o1", "o2")
+    assert parts[1].expr == im.make_tuple("y", "z")
+
+
+def test_split_mixed_entity_tuple_setat_keeps_uniform_setat():
+    stmt = ir.SetAt(
+        expr=im.make_tuple("y", "z"),
+        domain=im.make_tuple(_udom("Cell", _K), _udom("Cell", _K)),
+        target=im.make_tuple("o1", "o2"),
+    )
+    assert _split_mixed_entity_tuple_setat(stmt) is None
+
+
+def test_domain_with_vertical_dims_of_flips_and_collapses_tuple():
+    cdom = im.domain(
+        common.GridType.CARTESIAN,
+        {common.Dimension("IDim"): (0, 3), _KH: (1, 5)},
+    )
+    node = im.ref("f")
+    node.type = ts.FieldType(
+        dims=[common.Dimension("IDim"), _K], dtype=ts.ScalarType(kind=ts.ScalarKind.FLOAT64)
+    )
+    result = _domain_with_vertical_dims_of(im.make_tuple(cdom, copy.deepcopy(cdom)), node)
+    assert cpm.is_call_to(result, "cartesian_domain")
+    axes = [nr.args[0].value for nr in result.args]
+    assert axes == ["IDim", "K"]
+    # untyped node: domain unchanged
+    assert _domain_with_vertical_dims_of(cdom, im.ref("g")) is cdom
+
+
+def test_collect_neighbor_tags_skips_the_field_read_by_neighbors():
+    # C2E list over an edge field that is itself an E2C reduction
+    inner = im.as_fieldop(im.lambda_("it")(im.neighbors("E2C", "it")))("cell_field")
+    inner_red = im.as_fieldop(
+        im.lambda_("l")(im.reduce("plus", im.literal_from_value(0.0))(im.deref("l")))
+    )(inner)
+    outer = im.as_fieldop(im.lambda_("it")(im.neighbors("C2E", "it")))(inner_red)
+    assert NeighborReductionUnroller._collect_neighbor_tags(outer) == {"C2E"}
+    # a list argument (not read via neighbors) is still followed
+    mapped = im.as_fieldop(
+        im.lambda_("a", "b")(im.map_list("multiplies")(im.deref("a"), im.deref("b")))
+    )("sparse", outer)
+    assert NeighborReductionUnroller._collect_neighbor_tags(mapped) == {"C2E"}

@@ -103,6 +103,21 @@ def _write_debug_output(text: str, *, stream=None) -> None:
 _DEBUG_FILE_INITIALIZED = False
 
 
+def _infer_types_for_unroller(
+    ir: itir.Program, offset_provider_type: common.OffsetProviderType
+) -> itir.Program:
+    """Types let the structured reduction unroller give each unrolled field op its own vertical
+    dim (K vs _StaggeredK); without them it falls back to the SetAt's vertical dim."""
+    try:
+        return infer(ir, offset_provider_type=offset_provider_type)
+    except Exception as exc:  # untyped fallback, see docstring
+        warnings.warn(
+            f"structured: type inference before reduction unrolling failed ({exc}); untyped fallback",
+            stacklevel=2,
+        )
+        return ir
+
+
 def _print_ir_block(title: str, ir: itir.Program, *, enabled: bool) -> None:
     if not enabled:
         return
@@ -430,6 +445,7 @@ def apply_common_transforms(
         _print_ir_block(
             "=== GTIR AFTER CARTESIAN DOMAIN AND TYPE REMAPPING ===", ir, enabled=print_ir
         )
+        ir = _infer_types_for_unroller(ir, offset_provider_type)
         ir = cart_unroll.CartesianReductionUnroller.apply(ir)  # type: ignore[assignment]
         ir = NormalizeShifts().visit(ir)
         _print_ir_block("=== GTIR AFTER CARTESIAN UNROLLING ===", ir, enabled=print_ir)
@@ -668,6 +684,7 @@ def apply_fieldview_transforms(
             symbolic_domain_sizes=cast(dict[str, str | int] | None, symbolic_domain_sizes),
             offset_provider=offset_provider,
         )
+        ir = _infer_types_for_unroller(ir, offset_provider_type)
         ir = cart_unroll.CartesianReductionUnroller.apply(ir)  # type: ignore[assignment]
         ir = NormalizeShifts().visit(ir)
         ir = concat_where.expand_tuple_args(ir, offset_provider_type=offset_provider_type)  # type: ignore[assignment]  # always an itir.Program

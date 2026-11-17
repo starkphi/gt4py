@@ -536,6 +536,126 @@ def _detect_setat_entity(domain_expr: ir.Expr) -> str | None:
     return None
 
 
+def _setat_member_key(domain_expr: ir.Expr) -> tuple[str | None, tuple[str, ...]]:
+    """(horizontal entity, non-horizontal axis names) of one member of a SetAt domain."""
+    entity = _detect_setat_entity(domain_expr)
+    other: list[str] = []
+    if cpm.is_call_to(domain_expr, ("unstructured_domain", "cartesian_domain")):
+        for nr in domain_expr.args:
+            if _named_range_args(nr) is not None:
+                name = _get_axis_name(nr.args[0])
+                if name is not None and name not in {"Edge", "Cell", "Vertex"}:
+                    other.append(name)
+    return entity, tuple(other)
+
+
+def _select_tuple_elements(expr: ir.Expr, indices: list[int]) -> ir.Expr:
+    """Select `indices` of a tuple-valued expression; pushes through let chains, drops dead lets."""
+    if cpm.is_call_to(expr, "make_tuple"):
+        elems = [copy.deepcopy(expr.args[i]) for i in indices]
+        return elems[0] if len(elems) == 1 else im.make_tuple(*elems)
+    if isinstance(expr, ir.FunCall) and isinstance(expr.fun, ir.Lambda) and len(
+        expr.fun.params
+    ) == len(expr.args):
+        new_body = _select_tuple_elements(expr.fun.expr, indices)
+        used = {str(ref.id) for ref in new_body.pre_walk_values().if_isinstance(ir.SymRef)}
+        kept = [
+            (param, arg)
+            for param, arg in zip(expr.fun.params, expr.args)
+            if str(param.id) in used
+        ]
+        if not kept:
+            return new_body
+        return ir.FunCall(
+            fun=ir.Lambda(params=[p for p, _ in kept], expr=new_body),
+            args=[copy.deepcopy(a) for _, a in kept],
+        )
+    elems = [im.tuple_get(i, copy.deepcopy(expr)) for i in indices]
+    return elems[0] if len(elems) == 1 else im.make_tuple(*elems)
+
+
+def _split_mixed_entity_tuple_setat(stmt: ir.SetAt) -> list[ir.SetAt] | None:
+    """Split a tuple SetAt whose outputs live on different entities / vertical dims.
+
+    Upstream combined programs (e.g. `apply_diffusion_to_prognostic_fields`) write
+    `{vn, w, theta_v, ...} @ {Edge x K, Cell x _StaggeredK, Cell x K, ...}` in one SetAt.
+    The remap below handles one entity per SetAt, so we emit one SetAt per
+    (entity, vertical dims) group, in order of first appearance. Work shared between
+    groups (let-bound intermediates) is duplicated.
+    """
+    if not (
+        cpm.is_call_to(stmt.domain, "make_tuple") and cpm.is_call_to(stmt.target, "make_tuple")
+    ):
+        return None
+    members = stmt.domain.args
+    if len(members) != len(stmt.target.args):
+        return None
+    keys = [_setat_member_key(m) for m in members]
+    if len(set(keys)) <= 1:
+        return None
+    groups: dict[tuple, list[int]] = {}
+    for i, key in enumerate(keys):
+        groups.setdefault(key, []).append(i)
+    result = []
+    for indices in groups.values():
+        if len(indices) == 1:
+            domain = copy.deepcopy(members[indices[0]])
+            target = copy.deepcopy(stmt.target.args[indices[0]])
+        else:
+            domain = im.make_tuple(*(copy.deepcopy(members[i]) for i in indices))
+            target = im.make_tuple(*(copy.deepcopy(stmt.target.args[i]) for i in indices))
+        result.append(
+            ir.SetAt(expr=_select_tuple_elements(stmt.expr, indices), domain=domain, target=target)
+        )
+    return result
+
+
+def _domain_with_vertical_dims_of(domain: ir.Expr | None, node: ir.Node) -> ir.Expr | None:
+    """Fit the inherited SetAt `domain` to a single-field op: one tuple member, and K <-> its
+    staggered counterpart swapped to match the vertical dim of `node.type`.
+
+    Unrolled field ops inherit the SetAt domain, but an intermediate can live on the other
+    vertical dim (e.g. a K reduction shifted onto `_StaggeredK` levels). Bounds are kept: they
+    are placeholders, the final domain inference overwrites them.
+    """
+    if domain is None or not isinstance(node.type, ts.FieldType):
+        return domain
+    if cpm.is_call_to(domain, "make_tuple") and domain.args:
+        # a single-field op takes one member of a tuple SetAt domain (members of a split
+        # SetAt share entity and horizontal range); helpers read bounds from a plain domain
+        domain = domain.args[0]
+    node_dims = {d.value for d in node.type.dims if d.kind == common.DimensionKind.VERTICAL}
+    if not node_dims:
+        return domain
+
+    def fix(dom: ir.Expr) -> ir.Expr:
+        if cpm.is_call_to(dom, "make_tuple"):
+            return im.make_tuple(*(fix(a) for a in dom.args))
+        if not cpm.is_call_to(dom, ("cartesian_domain", "unstructured_domain")):
+            return dom
+        new_ranges = []
+        changed = False
+        for nr in dom.args:
+            axis = nr.args[0] if _named_range_args(nr) is not None else None
+            if (
+                isinstance(axis, ir.AxisLiteral)
+                and axis.kind == common.DimensionKind.VERTICAL
+                and axis.value not in node_dims
+            ):
+                flipped = common.flip_staggered(common.Dimension(axis.value, axis.kind))
+                if flipped.value in node_dims:
+                    nr = im.named_range(
+                        ir.AxisLiteral(value=flipped.value, kind=axis.kind),
+                        copy.deepcopy(nr.args[1]),
+                        copy.deepcopy(nr.args[2]),
+                    )
+                    changed = True
+            new_ranges.append(nr)
+        return im.call(dom.fun.id)(*new_ranges) if changed else dom
+
+    return fix(domain)
+
+
 def _is_unstructured_edge_domain_stmt(domain_expr: ir.Expr) -> bool:
     return _detect_setat_entity(domain_expr) == "Edge"
 
@@ -1565,7 +1685,11 @@ class SetAtRemapper(NodeTranslator):
         symbolic_domain_sizes: dict[str, Any] = kwargs.get("symbolic_domain_sizes") or {}
 
         new_body: list[ir.SetAt] = []
+        split_body: list[ir.Stmt] = []
         for stmt in node.body:
+            parts = _split_mixed_entity_tuple_setat(stmt) if isinstance(stmt, ir.SetAt) else None
+            split_body.extend(parts if parts is not None else [stmt])
+        for stmt in split_body:
             if (
                 isinstance(stmt, ir.SetAt)
                 and _detect_setat_entity(stmt.domain) == "Edge"
@@ -2460,7 +2584,27 @@ class NeighborReductionUnroller(NodeTranslator):
 
     @staticmethod
     def _collect_neighbor_tags(expr: ir.Expr) -> set[str]:
-        """Return all connectivity names used in neighbors() calls within expr."""
+        """Return the connectivity names of the neighbor lists that make up the list `expr`.
+
+        The field read by `neighbors(conn, it)` inside a field-op stencil is not part of the
+        list: its own (nested) reductions are skipped, e.g. `C2E` of an edge field that is
+        itself an `E2C` reduction yields only `C2E`.
+        """
+        if cpm.is_applied_as_fieldop(expr) and isinstance(expr.fun.args[0], ir.Lambda):
+            stencil = expr.fun.args[0]
+            stencil_tags: set[str] = set()
+            field_params: set[str] = set()
+            for call in stencil.expr.pre_walk_values().if_isinstance(ir.FunCall):
+                if cpm.is_call_to(call, "neighbors") and len(call.args) == 2:
+                    offset, it = call.args
+                    if isinstance(offset, ir.OffsetLiteral) and isinstance(offset.value, str):
+                        stencil_tags.add(offset.value)
+                    if isinstance(it, ir.SymRef):
+                        field_params.add(str(it.id))
+            for param, arg in zip(stencil.params, expr.args):
+                if str(param.id) not in field_params:
+                    stencil_tags |= NeighborReductionUnroller._collect_neighbor_tags(arg)
+            return stencil_tags
         tags: set[str] = set()
         for call in expr.pre_walk_values().if_isinstance(ir.FunCall):
             if cpm.is_call_to(call, "neighbors") and len(call.args) == 2:
@@ -2925,6 +3069,9 @@ class NeighborReductionUnroller(NodeTranslator):
 
     def visit_FunCall(self, node: ir.FunCall, **kwargs) -> ir.Expr:
         current_domain = kwargs.get("current_domain")
+        if cpm.is_applied_as_fieldop(node):
+            current_domain = _domain_with_vertical_dims_of(current_domain, node)
+            kwargs["current_domain"] = current_domain
         current_kolor: int | None = kwargs.get("current_kolor")
         setat_is_vertex: bool = kwargs.get("setat_is_vertex", False)
 
