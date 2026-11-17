@@ -302,6 +302,10 @@ def _process_symbolic_domains_option(
     return symbolic_domain_sizes
 
 
+#: sds key prefix for compile-time scalar constants handed over by the structured wrapper's caller
+STATIC_SCALAR_PREFIX = "__static_scalar__"
+
+
 def pre_inline_scalar_params(
     program: itir.Program, sds: dict | None
 ) -> itir.Program:
@@ -339,6 +343,19 @@ def pre_inline_scalar_params(
     for param in program.params:
         pid = str(param.id)
         if pid in _unsafe:
+            continue
+        # Compile-time scalar constants (icon4py setup_program's scalar `constant_args`, e.g. rayleigh_type): what the
+        # unstructured path bakes in as static args. Inlined as typed value literals (not OffsetLiterals), so that
+        # value branches like `if rayleigh_type == 2` fold away.
+        static_val = sds.get(f"{STATIC_SCALAR_PREFIX}{pid}")
+        if static_val is not None and isinstance(static_val, (bool, numbers.Integral, numbers.Real)):
+            ptype = getattr(param, "type", None)
+            if isinstance(static_val, bool):
+                subst[pid] = im.literal_from_value(bool(static_val))
+            elif isinstance(ptype, _ts.ScalarType):
+                # int(...): an IntEnum (e.g. RayleighType) would print as "RayleighType.KLEMP"
+                value = int(static_val) if isinstance(static_val, numbers.Integral) else float(static_val)
+                subst[pid] = itir.Literal(value=str(value), type=ptype)
             continue
         val = sds.get(pid)
         # bool must be checked before Integral because bool subclasses int in Python.
@@ -472,7 +489,10 @@ def apply_common_transforms(
     ir = cast(itir.Program, ConstantFolding.apply(ir))
     # After ConstantFolding some K ranges may now be provably empty (e.g. when vertical_end
     # is small); prune those dead concat_where branches so they don't inflate the IR.
-    ir = prune_empty_concat_where.prune_empty_concat_where(
+    # Structured mode only: upstream's unstructured prune needs typed IR (`_broadcast_to`), and
+    # ConstantFolding leaves new nodes untyped ("Can not extract dimensions from 'None'").
+    if os.environ.get("USE_STRUCTURED_BACKEND", "0") == "1":
+        ir = prune_empty_concat_where.prune_empty_concat_where(
             ir, offset_provider=offset_provider, symbolic_domain_sizes=symbolic_domain_sizes
         )
     _print_ir_block(

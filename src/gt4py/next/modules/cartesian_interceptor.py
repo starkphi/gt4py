@@ -1093,6 +1093,10 @@ class GenericStructuredWrapper:
                         max_i=self.max_i,
                         max_j=self.max_j,
                     )
+                    if bounds is None and threshold_value >= len(edge_mapping_rows):
+                        # no edge at or after the threshold (e.g. an end = n_edges): empty box,
+                        # else the rewriter falls back to the full box and `Edge < end` is false
+                        bounds = {k: (0, 0, -1, -1) for k in range(3)}
                     if bounds is not None:
                         for kolor, (ilo, jlo, ihi, jhi) in bounds.items():
                             sds[f"{param_name}_k{kolor}_ilo"] = ilo
@@ -1116,6 +1120,8 @@ class GenericStructuredWrapper:
                         max_i=self.max_i,
                         max_j=self.max_j,
                     )
+                    if bounds is None and threshold_value >= len(cell_mapping_rows):
+                        bounds = {k: (0, 0, -1, -1) for k in range(2)}  # empty box, see Edge
                     if bounds is not None:
                         for kolor, (ilo, jlo, ihi, jhi) in bounds.items():
                             sds[f"{param_name}_k{kolor}_ilo"] = ilo
@@ -1813,7 +1819,9 @@ class GenericStructuredWrapper:
             for name, val in kwargs.items()
             if name in _all_threshold_params
             and isinstance(val, (int, np.integer))
-            and int(val) > 0
+            # >= 0: a start of 0 is still needed to pair it with its end (range bounds below);
+            # the single-threshold injection skips it (`Entity >= 0` is the full box anyway)
+            and int(val) >= 0
         ))
         extra_scalars = tuple(sorted(
             (name, bool(val))

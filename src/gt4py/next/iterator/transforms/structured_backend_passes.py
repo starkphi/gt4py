@@ -615,7 +615,8 @@ def _domain_with_vertical_dims_of(domain: ir.Expr | None, node: ir.Node) -> ir.E
     staggered counterpart swapped to match the vertical dim of `node.type`.
 
     Unrolled field ops inherit the SetAt domain, but an intermediate can live on the other
-    vertical dim (e.g. a K reduction shifted onto `_StaggeredK` levels). Bounds are kept: they
+    vertical dim (e.g. a K reduction shifted onto `_StaggeredK` levels) or have none at all
+    (vertical ranges are then dropped). Bounds are kept: they
     are placeholders, the final domain inference overwrites them.
     """
     if domain is None or not isinstance(node.type, ts.FieldType):
@@ -625,8 +626,6 @@ def _domain_with_vertical_dims_of(domain: ir.Expr | None, node: ir.Node) -> ir.E
         # SetAt share entity and horizontal range); helpers read bounds from a plain domain
         domain = domain.args[0]
     node_dims = {d.value for d in node.type.dims if d.kind == common.DimensionKind.VERTICAL}
-    if not node_dims:
-        return domain
 
     def fix(dom: ir.Expr) -> ir.Expr:
         if cpm.is_call_to(dom, "make_tuple"):
@@ -642,6 +641,11 @@ def _domain_with_vertical_dims_of(domain: ir.Expr | None, node: ir.Node) -> ir.E
                 and axis.kind == common.DimensionKind.VERTICAL
                 and axis.value not in node_dims
             ):
+                if not node_dims:
+                    # horizontal-only intermediate (e.g. a reduction over a CellField inside an
+                    # Edge x K SetAt): no vertical range, else its result type gains K
+                    changed = True
+                    continue
                 flipped = common.flip_staggered(common.Dimension(axis.value, axis.kind))
                 if flipped.value in node_dims:
                     nr = im.named_range(

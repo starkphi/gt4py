@@ -622,6 +622,20 @@ def test_domain_with_vertical_dims_of_flips_and_collapses_tuple():
     assert _domain_with_vertical_dims_of(cdom, im.ref("g")) is cdom
 
 
+def test_domain_with_vertical_dims_of_drops_k_for_horizontal_only_op():
+    # e.g. max_over(topography(E2C)) inside an Edge x K SetAt: the op has no vertical dim
+    cdom = im.domain(
+        common.GridType.CARTESIAN,
+        {common.Dimension("IDim"): (0, 3), _K: (0, 5)},
+    )
+    node = im.ref("f")
+    node.type = ts.FieldType(
+        dims=[common.Dimension("IDim")], dtype=ts.ScalarType(kind=ts.ScalarKind.FLOAT64)
+    )
+    result = _domain_with_vertical_dims_of(cdom, node)
+    assert [nr.args[0].value for nr in result.args] == ["IDim"]
+
+
 def test_collect_neighbor_tags_skips_the_field_read_by_neighbors():
     # C2E list over an edge field that is itself an E2C reduction
     inner = im.as_fieldop(im.lambda_("it")(im.neighbors("E2C", "it")))("cell_field")
